@@ -13,6 +13,7 @@ package_end()
 
 add_requires("preloader")
 add_requires("nlohmann_json v3.11.3")
+add_requires("fmt")
 
 target("BackgroundVideo")
     set_kind("shared")
@@ -20,7 +21,7 @@ target("BackgroundVideo")
     set_strip("all")
     add_files("src/*.cpp")
     add_includedirs("src")
-    add_packages("preloader", "nlohmann_json")
+    add_packages("preloader", "nlohmann_json", "fmt")
 
     if is_plat("android") then
         add_cxflags("-fPIC", "-O2", "-ffunction-sections", "-fdata-sections", "-fexceptions", "-w")
