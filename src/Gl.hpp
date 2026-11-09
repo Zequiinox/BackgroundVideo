@@ -1,7 +1,7 @@
 #pragma once
 
-#include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 namespace bgv::gl {
 
