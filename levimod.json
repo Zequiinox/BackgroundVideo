@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "backgroundvideo",
+  "version": "1.0.0",
+  "minecraft_versions": ["26.62"],
+  "info": {
+    "name": "BackgroundVideo",
+    "author": "Your Name",
+    "description": "Plays your own video as the main menu background instead of the panorama.",
+    "tags": ["Visual"]
+  },
+  "release_assets": {
+    "include": ["*.levipack", "*.so"],
+    "labels": {
+      "BackgroundVideo.levipack": "LeviPack",
+      "libBackgroundVideo.so": "Native library"
+    }
+  }
+}

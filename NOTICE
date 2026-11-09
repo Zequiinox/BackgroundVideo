@@ -1,0 +1,6 @@
+BackgroundVideo reuses the project layout, the Preloader mod entry point,
+the eglSwapBuffers hook approach and the Runtime/Hooks helper patterns from
+BedrockTools (https://github.com/QYCottage/BedrockTools),
+Copyright (c) 2026 RadiantByte, distributed under the MIT License
+(the LICENSE file in that repository; its README mentions GPLv3 - check which applies
+before you publish this mod).
