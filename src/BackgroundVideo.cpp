@@ -142,6 +142,11 @@ int gUpdateFailures = 0;
 int gForeignSwaps = 0;       // consecutive frames swapped by a context that is not ours
 int gRetries = 0;
 long gFrameCount = 0;
+long gLastPanoFrame = -1000;  // frame in which a panorama face was last drawn
+bool gPanoThisFrame = false;
+bool gLastFramePano = false;
+int gTransitionLogs = 0;
+int gTraceFramesLeft = 0;
 long gMenuFrames = 0;
 long gPanoramaDraws = 0;
 long gDrawsInMenu[5]{};      // elements, arrays, elementsInstanced, arraysInstanced, rangeElements
@@ -168,8 +173,6 @@ std::vector<GLint> gLearning;
 GLint gLearnProgram = 0;
 int gFrameDraws = 0;
 bool gLearnOpen = true;
-bool gConformingNow = false;  // this frame started with the six face quads
-bool gPrevConforming = false; // ...and the previous frame did (so the first six quads of this frame are the panorama)
 
 long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -278,7 +281,6 @@ void learnPanorama(GLint program, GLsizei count, int index) {
     std::sort(unique.begin(), unique.end());
     unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
     if (unique.size() != 6 || unique.front() <= 0) return;
-    gConformingNow = true;
     if (unique != gPanoTextures) {
         gPanoTextures = unique;
         LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", program,
@@ -336,20 +338,18 @@ void traceDraw(const char* fn, GLsizei count, GLint program) {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-// Non-GL part of starting: makes sure the player is being prepared.
-enum class Startup { Unavailable, Preparing, Ready };
-
-Startup startupStep() {
+// Non-GL part of starting: makes sure the player is being prepared. True once it is ready to attach.
+bool startupStep() {
     switch (gPrep.load()) {
         case PrepReady:
-            return Startup::Ready;
+            return true;
         case PrepBusy:
-            return Startup::Preparing;
+            return false;
         case PrepFailed:
             gPrep = PrepNone;
             gNextRetry = Clock::now() + std::chrono::seconds(2);
             if (gRetries++ % 15 == 0) LOGW("could not play the video (is it a valid mp4?), will retry");
-            return Startup::Unavailable;
+            return false;
         default: {
             const auto path = findVideo();
             if (path.empty()) {
@@ -358,17 +358,23 @@ Startup startupStep() {
                     LOGW("cannot read a video at %s - set \"video_path\" in %s (the normal panorama stays)",
                         candidates().front().c_str(), configFile().c_str());
                 }
-                return Startup::Unavailable;
+                return false;
             }
             startPrepare(path);
-            return Startup::Preparing;
+            return false;
         }
     }
 }
 
-// GL part of starting, on the render thread: the player is ready and the renderer exists.
+// GL part of starting, on the render thread: needs the player to be ready.
 bool attachPlayback() {
+    if (!gRenderer.create()) {
+        gRenderer.destroy();
+        gFailed = true;
+        return false;
+    }
     if (!gPlayer.attachAndStart(gRenderer.texture)) {
+        gRenderer.destroy();
         gPlayer.release();
         gPrep = PrepNone;
         gNextRetry = Clock::now() + std::chrono::seconds(2);
@@ -376,6 +382,7 @@ bool attachPlayback() {
     }
     gLoadedPath = gPrepPath;
     gLoadedTime = gPrepTime;
+    gContext = eglGetCurrentContext();
     gStarted = true;
     gFirstFrame = false;
     gRetries = 0;
@@ -383,106 +390,33 @@ bool attachPlayback() {
     return true;
 }
 
-// The app was resumed and Android gave us a new GL context: keep the same MediaPlayer (so the video continues
-// where it was) and move it to a fresh SurfaceTexture in the new context.
-bool rebindToCurrentContext() {
-    const EGLContext context = eglGetCurrentContext();
-    LOGI("GL context changed (app resumed) - moving the video to the new context");
-    gl::SavedState saved;
-    gl::save(saved);
-    gRenderer.forget(); // the old objects died with the old context
-    const bool ok = gRenderer.create() && gPlayer.rebind(gRenderer.texture);
-    gl::restore(saved);
-    gForeignSwaps = 0;
-    if (ok) {
-        gContext = context;
-        gFirstFrame = false;
-        gUpdateFailures = 0;
-        return true;
-    }
-    LOGW("could not move the video, restarting it");
-    gRenderer.forget();
-    abandonResources();
-    if (gEnabled.load()) {
-        const auto path = findVideo();
-        if (!path.empty()) startPrepare(path);
-    }
-    return false;
-}
-
-void setupDrawState() {
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_BLEND);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, gRenderer.texture);
-    glBindSampler(0, 0);
-    glUseProgram(gRenderer.program);
-    glUniform1i(gRenderer.uSampler, 0);
-}
-
 // Draws the video into the current render target, exactly where the panorama would have gone.
-// While the video is not ready yet (opening, first frame, resuming) it draws black instead, so the original
-// panorama never shows through.
 bool renderVideo() {
-    Startup startup = Startup::Ready;
-    if (!gStarted) {
-        startup = startupStep();
-        if (startup == Startup::Unavailable) return false; // no usable video: the normal panorama stays
-    }
+    if (!gStarted && !startupStep()) return false; // still preparing: no GL work, the panorama stays
 
-    static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     gl::SavedState saved;
     gl::save(saved);
     bool shown = false;
     do {
-        const EGLContext context = eglGetCurrentContext();
-        if (gRenderer.ready() && gContext != EGL_NO_CONTEXT && gContext != context) { // left over from a dead context
-            gRenderer.forget();
-            gContext = EGL_NO_CONTEXT;
-        }
-        if (!gRenderer.ready()) {
-            if (!gRenderer.create()) {
-                gRenderer.destroy();
-                gFailed = true;
-                break;
-            }
-            gContext = context;
-        }
-
         if (!gStarted) {
-            if (startup == Startup::Ready) attachPlayback();
-            if (!gStarted) { // still opening: black
-                setupDrawState();
-                gRenderer.draw(1.0f, 1.0f, 0.0f, identity);
-                shown = true;
-                break;
-            }
+            if (!attachPlayback()) break;
         } else if (gPlayer.paused()) {
             gPlayer.resume();
         }
 
         float matrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        bool frame = gPlayer.update(matrix);
-        if (!frame) {
+        if (!gPlayer.update(matrix)) {
             if (++gUpdateFailures > 60) {
                 LOGW("video frames cannot be read, restarting");
                 gUpdateFailures = 0;
                 gReleaseRequested = true; // handled at the end of the frame
             }
-        } else {
-            gUpdateFailures = 0;
-            if (!gFirstFrame) gFirstFrame = gPlayer.frameReady();
-            frame = gFirstFrame;
-        }
-        if (!frame) { // no decoded frame yet: black
-            setupDrawState();
-            gRenderer.draw(1.0f, 1.0f, 0.0f, identity);
-            shown = true;
             break;
+        }
+        gUpdateFailures = 0;
+        if (!gFirstFrame) {
+            if (!gPlayer.frameReady()) break; // no decoded frame yet: the panorama shows for a moment
+            gFirstFrame = true;
         }
 
         const int width = saved.viewport[2], height = saved.viewport[3];
@@ -501,7 +435,18 @@ bool renderVideo() {
             else sx = videoAspect / screenAspect;
         }
 
-        setupDrawState();
+        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, gRenderer.texture);
+        glBindSampler(0, 0);
+        glUseProgram(gRenderer.program);
+        glUniform1i(gRenderer.uSampler, 0);
         if (!cover) gRenderer.draw(1.0f, 1.0f, 0.0f, identity); // black bars
         gRenderer.draw(sx, sy, gConfig.brightness, matrix);
         shown = true;
@@ -513,7 +458,12 @@ bool renderVideo() {
 // Returns true when the game's own draw call must be skipped because it was part of the panorama.
 bool replacePanorama(int fn, GLsizei count) {
     if (!gEnabled.load(std::memory_order_relaxed) || gFailed) return false;
-    if (!game::known() || !game::inMenu()) return false;
+    // The panorama is on screen in the main menu, but also behind other menu-like screens such as Profile, where the
+    // game can have a local player (so "no local player" is not a reliable signal). Once the panorama has been seen,
+    // keep looking for it for a second after the last sighting, wherever it shows up in the frame.
+    const bool menu = game::known() && game::inMenu();
+    const bool recentlySeen = gFrameCount - gLastPanoFrame < 60;
+    if (!menu && !recentlySeen) return false;
     ++gDrawsInMenu[fn];
     if (gTraceFrame) {
         static const char* const names[] = {"glDrawElements", "glDrawArrays", "glDrawElementsInstanced", "glDrawArraysInstanced", "glDrawRangeElements"};
@@ -521,31 +471,30 @@ bool replacePanorama(int fn, GLsizei count) {
         glGetIntegerv(GL_CURRENT_PROGRAM, &traceProgram);
         traceDraw(names[fn], count, traceProgram);
     }
-    // The panorama is always drawn first. Everything after the leading draws needs no work and no GL calls.
     const int index = gFrameDraws++;
-    if (index >= kLeadingDraws) return false;
+    if (gContext != EGL_NO_CONTEXT && eglGetCurrentContext() != gContext) return false;
 
+    // Learning only happens from the leading draws of a real menu frame.
+    const bool leading = menu && index < kLeadingDraws;
     GLint program = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
-    if (!gLoggedGl) {
-        gLoggedGl = true;
-        LOGI("GL: %s | %s", reinterpret_cast<const char*>(glGetString(GL_VERSION)), reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+    if (leading) {
+        glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        if (!gLoggedGl) {
+            gLoggedGl = true;
+            LOGI("GL: %s | %s", reinterpret_cast<const char*>(glGetString(GL_VERSION)), reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+        }
+        learnPanorama(program, count, index);
     }
-    learnPanorama(program, count, index);
-
-    const EGLContext context = eglGetCurrentContext();
-    const bool ownContext = gContext == EGL_NO_CONTEXT || context == gContext;
-    // The panorama is the first six quads of the frame, known from the previous frame. This position rule needs no
-    // GL ids, so it also works in the very first frame after the GL context was recreated (every id changed then).
-    bool panorama = gPrevConforming && index < 6 && count == 6;
-    if (!panorama && ownContext && count == 6 && !gPanoTextures.empty()) panorama = isPanoramaTexture(texture0());
-    if (!panorama && ownContext) panorama = isCubemapProgram(static_cast<GLuint>(program));
-    if (!panorama) return false;
-
-    if (!ownContext && gStarted && !rebindToCurrentContext()) return false; // app resumed: new GL context
     if (!gStarted && Clock::now() < gNextRetry) return false; // waiting before retrying a failed start
 
+    // Detection by the learned face textures works at any position in the frame; only quads (count 6) are checked.
+    bool panorama = count == 6 && !gPanoTextures.empty() && isPanoramaTexture(texture0());
+    if (!panorama && leading) panorama = isCubemapProgram(static_cast<GLuint>(program));
+    if (!panorama) return false;
+
     ++gPanoramaDraws;
+    gPanoThisFrame = true;
+    gLastPanoFrame = gFrameCount;
     gLastSeen = Clock::now();
     if (!gFrameHandled) {
         gFrameHandled = true;
@@ -602,16 +551,35 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     gFrameShown = false;
     gFrameDraws = 0;
     gLearnOpen = true;
-    gPrevConforming = gConformingNow;
-    gConformingNow = false;
 
     const EGLContext context = eglGetCurrentContext();
     const bool ownContext = gContext == EGL_NO_CONTEXT || context == gContext;
 
-    // Backup for the in-draw check: the app came back and a new GL context is swapping, but the panorama was not
-    // recognised in time to rebind there.
+    // The app was sent to the background and came back: Android destroyed our GL context and made a new one.
+    // Keep the same MediaPlayer (so the video continues where it was) and just move it to the new context.
     if (gStarted && !ownContext && context != EGL_NO_CONTEXT) {
-        if (++gForeignSwaps >= 3) rebindToCurrentContext();
+        if (++gForeignSwaps >= 5) {
+            gForeignSwaps = 0;
+            LOGI("GL context changed (app resumed) - moving the video to the new context");
+            gl::SavedState saved;
+            gl::save(saved);
+            gRenderer.forget(); // the old objects died with the old context
+            const bool ok = gRenderer.create() && gPlayer.rebind(gRenderer.texture);
+            gl::restore(saved);
+            if (ok) {
+                gContext = context;
+                gFirstFrame = false;
+                gUpdateFailures = 0; // playback resumes at the next panorama draw
+            } else {
+                LOGW("could not move the video, restarting it");
+                gRenderer.forget();
+                abandonResources();
+                if (gEnabled.load()) {
+                    const auto path = findVideo();
+                    if (!path.empty()) startPrepare(path); // be ready again before the next panorama draw
+                }
+            }
+        }
     } else {
         gForeignSwaps = 0;
     }
@@ -623,7 +591,17 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     }
 
     const bool menu = game::known() && game::inMenu();
-    gTraceFrame = gConfig.debugTrace && menu && (gMenuFrames == 300 || gMenuFrames == 301 || gMenuFrames == 302);
+    // Log every time the panorama appears or disappears (e.g. when opening Profile) and, with debug_trace on,
+    // trace the next two frames so a bug report shows what the screen is drawn like.
+    if (gPanoThisFrame != gLastFramePano && gTransitionLogs < 40) {
+        ++gTransitionLogs;
+        LOGI("panorama %s (inMenu=%d, frame %ld)", gPanoThisFrame ? "visible" : "gone", menu ? 1 : 0, gFrameCount);
+        if (gConfig.debugTrace && gTransitionLogs <= 8) gTraceFramesLeft = 2;
+    }
+    gLastFramePano = gPanoThisFrame;
+    gPanoThisFrame = false;
+    gTraceFrame = gConfig.debugTrace && ((menu && (gMenuFrames == 300 || gMenuFrames == 301 || gMenuFrames == 302)) || gTraceFramesLeft > 0);
+    if (gTraceFramesLeft > 0) --gTraceFramesLeft;
     if (gTraceFrame && gMenuFrames == 300) LOGI("--- tracing 3 menu frames ---");
     if ((gFrameCount % 600) == 0 && gFrameCount <= 18000) {
         LOGI("stat frames=%ld known=%d inMenu=%d menuFrames=%ld draws[el=%ld ar=%ld elI=%ld arI=%ld rng=%ld] panoramaDraws=%ld faces=%zu started=%d prep=%d failed=%d",

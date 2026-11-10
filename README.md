@@ -23,10 +23,9 @@ In 26.x the menu buttons are a separate HTML-based UI drawn on top of a native c
    destroys the GL context meanwhile; on return the mod gives the *same* MediaPlayer a fresh surface in the new context
    and resumes it, so the video continues exactly where it was instead of restarting.
 
-While the video is not ready yet (opening, waiting for its first frame, right after returning to the app) the panorama
-spot is drawn black instead, so the original panorama never shows through. The panorama is recognised by its position
-(the first six quads of the menu frame, known from the previous frame), which needs no GL ids and so also works in the
-very first frame after Android recreates the GL context.
+The panorama is recognised by its six face textures wherever they appear in the frame, and for a second after it was last
+seen, so screens that open on top of the menu (e.g. Profile, where the game can have a local player) keep the video.
+`log.txt` records every time the panorama appears or disappears.
 
 If the video is missing or cannot be played, the mod steps aside and the normal panorama is shown.
 
