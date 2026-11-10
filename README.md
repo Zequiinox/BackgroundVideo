@@ -9,9 +9,11 @@ Built for Minecraft Bedrock 26.62, Android arm64-v8a.
 In 26.x the menu buttons are a separate HTML-based UI drawn on top of a native cubemap panorama
 (`CubemapBackgroundScreen` / `PanoramaRenderer`). The mod replaces that panorama in place:
 
-1. It hooks the GL draw calls in `libGLESv2.so` (the same technique BedrockTools' Motion Blur uses for `glClear`).
-2. While no world is loaded, any draw that uses a cube map sampler is the panorama. That draw call is
-   skipped and the video is drawn into the same render target instead, so the buttons still sit on top.
+1. It hooks the GL draw calls in `libGLESv2.so` / `libGLESv3.so` (the same technique BedrockTools' Motion Blur uses for `glClear`).
+2. On the tested build (Mali GPU, GLES 3.2) the panorama is the first six draws of every menu frame: six quads, each with
+   its own 2D texture (the six cube faces). The mod learns those six texture ids from the start of each menu frame, then
+   skips exactly those draws and draws the video in their place, so the buttons still sit on top. (If a build uses a real
+   cube map sampler instead, that is detected as well.)
 3. Menu detection reuses two BedrockTools signatures (`ClientInstance::update` and `getLocalPlayer`),
    which all match exactly once in the 26.62 `libminecraftpe.so`.
 4. Decoding and optional audio use Android's `MediaPlayer` over JNI, so any mp4 the phone can play works.
@@ -64,6 +66,7 @@ The same lines go to logcat under the tag `BackgroundVideo`.
 
 - `panorama replaced by video` means it is working.
 - `signatures not found`: this Minecraft build changed the two functions; the patterns in `src/Signatures.cpp` need updating.
-- `in menu ... but no cubemap draw was seen`: the panorama is not drawn with a cube map sampler on this build; the trace shows how it is drawn.
+- `in menu ... but the panorama was never recognised`: the first draws of a menu frame do not look like six face quads; the trace in `log.txt` shows how the frame is drawn.
+- `learned panorama faces: ...` means the six face textures were found.
 - `cannot read a video at ...`: the path in `video_path` is wrong, or the launcher has no storage access to that file.
 - Use an unrotated, H.264 mp4 at or below your screen resolution for the smoothest result.

@@ -145,6 +145,13 @@ long gDrawsInMenu[5]{};            // elements, arrays, elementsInstanced, array
 bool gTraceFrame = false;          // log every draw call of a few menu frames
 bool gLoggedGl = false;
 int gProgramsLogged = 0;
+// On this build the panorama is six separate quads (index count 6), each with its own 2D texture, drawn first in
+// every menu frame. The mod learns those six texture ids from the start of each menu frame.
+std::vector<GLint> gPanoTextures;   // texture ids of the six faces (last time they were seen)
+std::vector<GLint> gLearning;       // textures of the leading quads of the current frame
+GLint gLearnProgram = 0;
+int gFrameDraws = 0;                // draws seen so far this frame (menu only)
+bool gLearnOpen = true;             // still collecting this frame's leading run
 Clock::time_point gLastSeen{};
 std::unordered_map<GLuint, bool> gProgramCache;
 
@@ -193,6 +200,47 @@ void traceDraw(const char* fn, GLsizei count, GLint program) {
     }
     glActiveTexture(static_cast<GLenum>(active));
     LOGI("trace %s prog=%d fbo=%d vp=%dx%d count=%d %s", fn, program, fbo, viewport[2], viewport[3], count, units);
+}
+
+GLint texture0() {
+    GLint active = 0, texture = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glActiveTexture(static_cast<GLenum>(active));
+    return texture;
+}
+
+bool isPanoramaTexture(GLint texture) {
+    return std::find(gPanoTextures.begin(), gPanoTextures.end(), texture) != gPanoTextures.end();
+}
+
+// Looks at the leading draws of a menu frame: six quads with the same program and six different textures
+// are the panorama faces. Called for every menu draw; only the first six per frame do any work.
+void learnPanorama(GLint program, GLsizei count) {
+    if (!gLearnOpen) return;
+    const int index = gFrameDraws - 1;
+    const bool conforming = count == 6 && index < 6 && (index == 0 || program == gLearnProgram);
+    if (!conforming) {
+        gLearnOpen = false;
+        return;
+    }
+    if (index == 0) {
+        gLearning.clear();
+        gLearnProgram = program;
+    }
+    gLearning.push_back(texture0());
+    if (index < 5) return;
+    gLearnOpen = false;
+    std::vector<GLint> unique = gLearning;
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    if (unique.size() != 6 || unique.front() <= 0) return; // not six different textures: not the panorama
+    if (unique != gPanoTextures) {
+        gPanoTextures = unique;
+        LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", program,
+            unique[0], unique[1], unique[2], unique[3], unique[4], unique[5]);
+    }
 }
 
 enum class Begin { Ok, Retry, Fatal };
@@ -290,7 +338,6 @@ bool renderVideo() {
 bool replacePanorama(int fn, GLsizei count) {
     if (!gEnabled.load(std::memory_order_relaxed) || gFailed) return false;
     if (!game::known() || !game::inMenu()) return false;
-    if (!gStarted && Clock::now() < gNextRetry) return false;
     if (gContext != EGL_NO_CONTEXT && eglGetCurrentContext() != gContext) return false;
 
     GLint program = 0;
@@ -304,7 +351,12 @@ bool replacePanorama(int fn, GLsizei count) {
         static const char* const names[] = {"glDrawElements", "glDrawArrays", "glDrawElementsInstanced", "glDrawArraysInstanced", "glDrawRangeElements"};
         traceDraw(names[fn], count, program);
     }
-    if (!isCubemapProgram(static_cast<GLuint>(program))) return false;
+    ++gFrameDraws;
+    learnPanorama(program, count);
+    if (!gStarted && Clock::now() < gNextRetry) return false; // waiting before retrying a failed start
+    bool panorama = count == 6 && !gPanoTextures.empty() && isPanoramaTexture(texture0());
+    if (!panorama) panorama = isCubemapProgram(static_cast<GLuint>(program)); // other builds: real cube map
+    if (!panorama) return false;
 
     ++gCubemapDraws;
     gLastSeen = Clock::now();
@@ -313,7 +365,7 @@ bool replacePanorama(int fn, GLsizei count) {
         gFrameShown = renderVideo();
         if (gFrameShown && !gLoggedReplace) {
             gLoggedReplace = true;
-            LOGI("panorama replaced by video (cubemap program %d)", program);
+            LOGI("panorama replaced by video (program %d)", program);
         }
     }
     return gFrameShown;
@@ -368,6 +420,8 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     ++gFrameCount;
     gFrameHandled = false;
     gFrameShown = false;
+    gFrameDraws = 0;
+    gLearnOpen = true;
 
     if (gReleaseRequested.exchange(false, std::memory_order_acq_rel) && gStarted
         && (gContext == EGL_NO_CONTEXT || eglGetCurrentContext() == gContext)) {
@@ -379,15 +433,15 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     gTraceFrame = menu && (gMenuFrames == 300 || gMenuFrames == 301 || gMenuFrames == 302);
     if (gMenuFrames == 300 && menu) LOGI("--- tracing 3 menu frames ---");
     if ((gFrameCount % 600) == 0 && gFrameCount <= 18000) {
-        LOGI("stat frames=%ld known=%d inMenu=%d menuFrames=%ld draws[el=%ld ar=%ld elI=%ld arI=%ld rng=%ld] cubemapDraws=%ld started=%d failed=%d",
+        LOGI("stat frames=%ld known=%d inMenu=%d menuFrames=%ld draws[el=%ld ar=%ld elI=%ld arI=%ld rng=%ld] panoramaDraws=%ld faces=%zu started=%d failed=%d",
             gFrameCount, game::known() ? 1 : 0, game::inMenu() ? 1 : 0, gMenuFrames, gDrawsInMenu[0], gDrawsInMenu[1],
-            gDrawsInMenu[2], gDrawsInMenu[3], gDrawsInMenu[4], gCubemapDraws, gStarted ? 1 : 0, gFailed ? 1 : 0);
+            gDrawsInMenu[2], gDrawsInMenu[3], gDrawsInMenu[4], gCubemapDraws, gPanoTextures.size(), gStarted ? 1 : 0, gFailed ? 1 : 0);
     }
     if (menu) {
         ++gMenuFrames;
         if (!gLoggedNoCubemap && gCubemapDraws == 0 && gMenuFrames > 600) {
             gLoggedNoCubemap = true;
-            LOGW("in menu for %ld frames but no cubemap draw was seen - the panorama could not be located", gMenuFrames);
+            LOGW("in menu for %ld frames but the panorama was never recognised - see the trace above", gMenuFrames);
         }
     }
 
