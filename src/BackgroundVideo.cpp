@@ -133,7 +133,7 @@ std::atomic_bool gDiscard{false}; // release the player as soon as the helper th
 Player gPlayer;
 gl::Renderer gRenderer;
 EGLContext gContext = EGL_NO_CONTEXT;
-bool gStarted = false;       // attached to the GL context and playing
+std::atomic_bool gStarted{false}; // attached to the GL context and playing (read by the watchdog thread)
 bool gFirstFrame = false;    // a decoded frame has been latched at least once
 bool gFailed = false;        // unrecoverable (shader problem)
 bool gFrameHandled = false;  // we already decided what to do with the panorama this frame
@@ -150,6 +150,8 @@ bool gLoggedNoPanorama = false;
 bool gLoggedGl = false;
 bool gTraceFrame = false;
 int gProgramsLogged = 0;
+std::atomic<long long> gLastSwapMs{0}; // when the render thread last finished a frame
+std::atomic_bool gWatchdogRun{false};
 Clock::time_point gNextRetry{};
 Clock::time_point gLastSeen{};
 std::filesystem::path gPrepPath;       // the file being (or last) prepared
@@ -166,6 +168,27 @@ std::vector<GLint> gLearning;
 GLint gLearnProgram = 0;
 int gFrameDraws = 0;
 bool gLearnOpen = true;
+
+long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+// When the app goes to the background the render thread stops swapping buffers. This thread notices and pauses
+// the video, so it is exactly where you left it when you come back.
+void startWatchdog() {
+    if (gWatchdogRun.exchange(true)) return;
+    std::thread([] {
+        while (gWatchdogRun.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const long long last = gLastSwapMs.load();
+            if (last > 0 && gStarted.load() && !gPlayer.paused() && nowMs() - last > 1000) {
+                LOGI("no frames for 1s (app in the background?) - pausing the video");
+                gPlayer.pause();
+            }
+        }
+        Player::detachThread();
+    }).detach();
+}
 
 // ---------------------------------------------------------------------------
 // Background preparation
@@ -507,6 +530,7 @@ void drawRangeElementsHook(GLenum mode, GLuint start, GLuint end, GLsizei count,
 
 EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     // End of frame: bookkeeping on the render thread (its GL context is current here).
+    gLastSwapMs.store(nowMs());
     ++gFrameCount;
     gFrameHandled = false;
     gFrameShown = false;
@@ -517,15 +541,28 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     const bool ownContext = gContext == EGL_NO_CONTEXT || context == gContext;
 
     // The app was sent to the background and came back: Android destroyed our GL context and made a new one.
-    // Everything bound to the old context is dead, so start over in the new one.
+    // Keep the same MediaPlayer (so the video continues where it was) and just move it to the new context.
     if (gStarted && !ownContext && context != EGL_NO_CONTEXT) {
-        if (++gForeignSwaps >= 10) {
-            LOGI("GL context changed (app resumed?) - restarting the video");
-            abandonResources();
+        if (++gForeignSwaps >= 5) {
             gForeignSwaps = 0;
-            if (gEnabled.load()) {
-                const auto path = findVideo();
-                if (!path.empty()) startPrepare(path); // be ready again before the next panorama draw
+            LOGI("GL context changed (app resumed) - moving the video to the new context");
+            gl::SavedState saved;
+            gl::save(saved);
+            gRenderer.forget(); // the old objects died with the old context
+            const bool ok = gRenderer.create() && gPlayer.rebind(gRenderer.texture);
+            gl::restore(saved);
+            if (ok) {
+                gContext = context;
+                gFirstFrame = false;
+                gUpdateFailures = 0; // playback resumes at the next panorama draw
+            } else {
+                LOGW("could not move the video, restarting it");
+                gRenderer.forget();
+                abandonResources();
+                if (gEnabled.load()) {
+                    const auto path = findVideo();
+                    if (!path.empty()) startPrepare(path);
+                }
             }
         }
     } else {
@@ -633,11 +670,13 @@ bool installHooks() {
     hookGl("glDrawElementsInstanced", reinterpret_cast<void*>(drawElementsInstancedHook), reinterpret_cast<void**>(&gDrawElementsInstancedOriginal));
     hookGl("glDrawArraysInstanced", reinterpret_cast<void*>(drawArraysInstancedHook), reinterpret_cast<void**>(&gDrawArraysInstancedOriginal));
     hookGl("glDrawRangeElements", reinterpret_cast<void*>(drawRangeElementsHook), reinterpret_cast<void**>(&gDrawRangeElementsOriginal));
+    startWatchdog();
     LOGI("hooks installed (%zu)", gHandles.size());
     return true;
 }
 
 void removeHooks() {
+    gWatchdogRun = false;
     for (auto handle : gHandles) hooks::remove(handle);
     gHandles.clear();
 }

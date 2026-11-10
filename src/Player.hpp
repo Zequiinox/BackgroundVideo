@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <jni.h>
+#include <mutex>
 #include <string>
 
 namespace bgv {
@@ -16,6 +18,9 @@ public:
     bool prepare(const std::string& path, float volume, bool loop);
     // Attaches the (so far detached) SurfaceTexture to a GL external texture and starts playback.
     bool attachAndStart(unsigned int texture);
+    // After the GL context was recreated: gives the same MediaPlayer a fresh SurfaceTexture on a new GL texture,
+    // so playback continues from where it was instead of starting over.
+    bool rebind(unsigned int texture);
     // Latches the newest decoded frame into the GL texture and returns its UV transform.
     bool update(float matrix[16]);
     // True once at least one decoded frame has been latched.
@@ -25,7 +30,7 @@ public:
     void release();
 
     bool active() const { return mPlayer != nullptr; }
-    bool paused() const { return mPaused; }
+    bool paused() const { return mPaused.load(); }
     int width() const { return mWidth; }
     int height() const { return mHeight; }
     int durationMs() const { return mDuration; }
@@ -54,7 +59,11 @@ private:
     int mDuration = 0;
     int mWidth = 0;
     int mHeight = 0;
-    bool mPaused = false;
+    std::atomic_bool mPaused{false};
+    std::mutex mMutex; // pause()/resume() can be called from the watchdog thread
+    jmethodID mStCtor = nullptr;
+    jmethodID mSurfaceCtor = nullptr;
+    jmethodID mSetSurface = nullptr;
 };
 
 }

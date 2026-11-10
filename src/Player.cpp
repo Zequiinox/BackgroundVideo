@@ -63,8 +63,8 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     };
     // SurfaceTexture(boolean) creates the texture detached from any GL context (Android 8+),
     // so the video can be opened long before the game has a GL context.
-    const jmethodID stCtor = method(mSurfaceTextureClass, "<init>", "(Z)V");
-    const jmethodID surfaceCtor = method(mSurfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
+    mStCtor = method(mSurfaceTextureClass, "<init>", "(Z)V");
+    mSurfaceCtor = method(mSurfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
     const jmethodID playerCtor = method(mPlayerClass, "<init>", "()V");
     mAttachToGlContext = method(mSurfaceTextureClass, "attachToGLContext", "(I)V");
     mUpdateTexImage = method(mSurfaceTextureClass, "updateTexImage", "()V");
@@ -73,7 +73,7 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     mSurfaceTextureRelease = method(mSurfaceTextureClass, "release", "()V");
     mSurfaceRelease = method(mSurfaceClass, "release", "()V");
     const jmethodID setDataSource = method(mPlayerClass, "setDataSource", "(Ljava/lang/String;)V");
-    const jmethodID setSurface = method(mPlayerClass, "setSurface", "(Landroid/view/Surface;)V");
+    mSetSurface = method(mPlayerClass, "setSurface", "(Landroid/view/Surface;)V");
     const jmethodID setVolume = method(mPlayerClass, "setVolume", "(FF)V");
     const jmethodID setLooping = method(mPlayerClass, "setLooping", "(Z)V");
     const jmethodID prepareMethod = method(mPlayerClass, "prepare", "()V");
@@ -84,17 +84,17 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     const jmethodID getDuration = method(mPlayerClass, "getDuration", "()I");
     const jmethodID getVideoWidth = method(mPlayerClass, "getVideoWidth", "()I");
     const jmethodID getVideoHeight = method(mPlayerClass, "getVideoHeight", "()I");
-    if (!stCtor || !surfaceCtor || !playerCtor || !mAttachToGlContext || !mUpdateTexImage || !mGetTimestamp
-        || !mGetTransformMatrix || !setDataSource || !setSurface || !prepareMethod || !mPlayerStart || !mPlayerPause) {
+    if (!mStCtor || !mSurfaceCtor || !playerCtor || !mAttachToGlContext || !mUpdateTexImage || !mGetTimestamp
+        || !mGetTransformMatrix || !setDataSource || !mSetSurface || !prepareMethod || !mPlayerStart || !mPlayerPause) {
         return fail(env, "method lookup (needs Android 8+)");
     }
 
-    jobject st = env->NewObject(mSurfaceTextureClass, stCtor, JNI_FALSE);
+    jobject st = env->NewObject(mSurfaceTextureClass, mStCtor, JNI_FALSE);
     if (!st || !javaOk(env, "SurfaceTexture")) return fail(env, "SurfaceTexture");
     mSurfaceTexture = env->NewGlobalRef(st);
     env->DeleteLocalRef(st);
 
-    jobject surface = env->NewObject(mSurfaceClass, surfaceCtor, mSurfaceTexture);
+    jobject surface = env->NewObject(mSurfaceClass, mSurfaceCtor, mSurfaceTexture);
     if (!surface || !javaOk(env, "Surface")) return fail(env, "Surface");
     mSurface = env->NewGlobalRef(surface);
     env->DeleteLocalRef(surface);
@@ -108,7 +108,7 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     env->CallVoidMethod(mPlayer, setDataSource, jpath);
     env->DeleteLocalRef(jpath);
     if (!javaOk(env, "setDataSource")) return fail(env, "setDataSource");
-    env->CallVoidMethod(mPlayer, setSurface, mSurface);
+    env->CallVoidMethod(mPlayer, mSetSurface, mSurface);
     if (!javaOk(env, "setSurface")) return fail(env, "setSurface");
     if (setLooping) env->CallVoidMethod(mPlayer, setLooping, loop ? JNI_TRUE : JNI_FALSE);
     if (setVolume) env->CallVoidMethod(mPlayer, setVolume, volume, volume);
@@ -130,6 +130,7 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
 }
 
 bool Player::attachAndStart(unsigned int texture) {
+    std::lock_guard<std::mutex> lock(mMutex);
     JNIEnv* env = currentEnv();
     if (!env || !mPlayer || !mSurfaceTexture) return false;
     env->CallVoidMethod(mSurfaceTexture, mAttachToGlContext, static_cast<jint>(texture));
@@ -137,6 +138,52 @@ bool Player::attachAndStart(unsigned int texture) {
     env->CallVoidMethod(mPlayer, mPlayerStart);
     if (!javaOk(env, "start")) return false;
     mPaused = false;
+    return true;
+}
+
+bool Player::rebind(unsigned int texture) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    JNIEnv* env = currentEnv();
+    if (!env || !mPlayer || !mStCtor || !mSurfaceCtor || !mSetSurface) return false;
+
+    jobject st = env->NewObject(mSurfaceTextureClass, mStCtor, JNI_FALSE);
+    if (!st || !javaOk(env, "SurfaceTexture (rebind)")) return false;
+    jobject newTexture = env->NewGlobalRef(st);
+    env->DeleteLocalRef(st);
+    jobject surface = env->NewObject(mSurfaceClass, mSurfaceCtor, newTexture);
+    if (!surface || !javaOk(env, "Surface (rebind)")) {
+        env->DeleteGlobalRef(newTexture);
+        return false;
+    }
+    jobject newSurface = env->NewGlobalRef(surface);
+    env->DeleteLocalRef(surface);
+
+    env->CallVoidMethod(newTexture, mAttachToGlContext, static_cast<jint>(texture));
+    bool ok = javaOk(env, "attachToGLContext (rebind)");
+    if (ok) {
+        env->CallVoidMethod(mPlayer, mSetSurface, newSurface);
+        ok = javaOk(env, "setSurface (rebind)");
+    }
+    if (!ok) {
+        env->DeleteGlobalRef(newSurface);
+        env->DeleteGlobalRef(newTexture);
+        return false;
+    }
+
+    // Drop the old surface; its GL context no longer exists, so errors here are expected and ignored.
+    if (mSurface && mSurfaceRelease) {
+        env->CallVoidMethod(mSurface, mSurfaceRelease);
+        javaOk(env, "old Surface.release");
+    }
+    if (mSurfaceTexture && mSurfaceTextureRelease) {
+        env->CallVoidMethod(mSurfaceTexture, mSurfaceTextureRelease);
+        javaOk(env, "old SurfaceTexture.release");
+    }
+    if (mSurface) env->DeleteGlobalRef(mSurface);
+    if (mSurfaceTexture) env->DeleteGlobalRef(mSurfaceTexture);
+    mSurface = newSurface;
+    mSurfaceTexture = newTexture;
+    LOGI("video moved to the new GL context (still %s)", mPaused.load() ? "paused" : "playing");
     return true;
 }
 
@@ -160,6 +207,7 @@ bool Player::frameReady() {
 }
 
 void Player::pause() {
+    std::lock_guard<std::mutex> lock(mMutex);
     JNIEnv* env = currentEnv();
     if (!env || !mPlayer || mPaused) return;
     env->CallVoidMethod(mPlayer, mPlayerPause);
@@ -168,6 +216,7 @@ void Player::pause() {
 }
 
 void Player::resume() {
+    std::lock_guard<std::mutex> lock(mMutex);
     JNIEnv* env = currentEnv();
     if (!env || !mPlayer || !mPaused) return;
     env->CallVoidMethod(mPlayer, mPlayerStart);
@@ -176,6 +225,7 @@ void Player::resume() {
 }
 
 void Player::release() {
+    std::lock_guard<std::mutex> lock(mMutex);
     JNIEnv* env = currentEnv();
     if (!env) return;
     releaseAll(env);

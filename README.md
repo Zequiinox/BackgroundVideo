@@ -19,8 +19,9 @@ In 26.x the menu buttons are a separate HTML-based UI drawn on top of a native c
 4. Decoding and optional audio use Android's `MediaPlayer` over JNI, so any mp4 the phone can play works.
 5. The video is opened on a background thread while Minecraft is still starting (so it is ready when the menu appears,
    and the render thread is never blocked), loops while the menu shows, and pauses when you join a world.
-6. If the app goes to the background and comes back, Android destroys the GL context; the mod notices the new context
-   and restarts the video in it.
+6. When the app goes to the background the video is paused (a small watchdog notices that frames stopped). Android
+   destroys the GL context meanwhile; on return the mod gives the *same* MediaPlayer a fresh surface in the new context
+   and resumes it, so the video continues exactly where it was instead of restarting.
 
 If the video is missing or anything fails, the mod steps aside and the normal panorama is shown.
 
