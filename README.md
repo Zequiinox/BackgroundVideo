@@ -55,11 +55,15 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
 | `brightness` | `1.0` | Lower it to dim the video if menu text is hard to read |
 
-## Troubleshooting (adb logcat -s BackgroundVideo)
+## Troubleshooting
 
-- `hooks installed` / `game hooks installed` / `state: menu` confirm the setup. 
+The mod writes `log.txt` next to `config.json` (the mod's config folder), rewritten on every start. It records
+the hooks that were installed, whether menu detection works, which draw calls the game uses, a short trace of
+three menu frames, and a stat line every ~10 seconds. Send it along when reporting a problem.
+The same lines go to logcat under the tag `BackgroundVideo`.
+
 - `panorama replaced by video` means it is working.
-- `cannot read a video at ...`: the path in `video_path` is wrong, or the launcher has no storage access to that file.
 - `signatures not found`: this Minecraft build changed the two functions; the patterns in `src/Signatures.cpp` need updating.
-- `in menu ... but no cubemap draw was seen`: the panorama is not drawn with a cube map sampler on this build/renderer.
+- `in menu ... but no cubemap draw was seen`: the panorama is not drawn with a cube map sampler on this build; the trace shows how it is drawn.
+- `cannot read a video at ...`: the path in `video_path` is wrong, or the launcher has no storage access to that file.
 - Use an unrotated, H.264 mp4 at or below your screen resolution for the smoothest result.

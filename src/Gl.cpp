@@ -1,7 +1,6 @@
 #include "Gl.hpp"
-#include <android/log.h>
+#include "Log.hpp"
 
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "BackgroundVideo", __VA_ARGS__)
 
 namespace bgv::gl {
 namespace {

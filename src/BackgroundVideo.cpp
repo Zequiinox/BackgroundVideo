@@ -2,23 +2,22 @@
 #include "Game.hpp"
 #include "Gl.hpp"
 #include "Hooks.hpp"
+#include "Log.hpp"
 #include "Player.hpp"
 
 #include <EGL/egl.h>
-#include <android/log.h>
+#include "Log.hpp"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BackgroundVideo", __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "BackgroundVideo", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "BackgroundVideo", __VA_ARGS__)
 
 namespace bgv::video {
 namespace {
@@ -142,6 +141,10 @@ std::filesystem::file_time_type gLoadedTime{};
 long gFrameCount = 0;
 long gMenuFrames = 0;
 long gCubemapDraws = 0;
+long gDrawsInMenu[5]{};            // elements, arrays, elementsInstanced, arraysInstanced, rangeElements
+bool gTraceFrame = false;          // log every draw call of a few menu frames
+bool gLoggedGl = false;
+int gProgramsLogged = 0;
 Clock::time_point gLastSeen{};
 std::unordered_map<GLuint, bool> gProgramCache;
 
@@ -153,17 +156,43 @@ bool isCubemapProgram(GLuint program) {
     bool cube = false;
     GLint count = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
-    for (GLint i = 0; i < count && !cube; ++i) {
+    char samplers[160]{};
+    int used = 0;
+    for (GLint i = 0; i < count; ++i) {
         char name[96]{};
         GLsizei length = 0;
         GLint size = 0;
         GLenum type = 0;
         glGetActiveUniform(program, i, sizeof(name) - 1, &length, &size, &type, name);
-        cube = type == GL_SAMPLER_CUBE || type == GL_SAMPLER_CUBE_SHADOW;
+        if (type == GL_SAMPLER_CUBE || type == GL_SAMPLER_CUBE_SHADOW) cube = true;
+        if (type >= 0x8B5E && type <= 0x8B62 && used < static_cast<int>(sizeof(samplers)) - 24) // sampler types
+            used += std::snprintf(samplers + used, sizeof(samplers) - used, "%s=0x%X ", name, type);
+    }
+    if (gProgramsLogged < 60) {
+        ++gProgramsLogged;
+        LOGI("menu program %u: %d uniforms, cubemap=%d, samplers: %s", program, count, cube ? 1 : 0, samplers);
     }
     if (gProgramCache.size() > 1024) gProgramCache.clear();
     gProgramCache[program] = cube;
     return cube;
+}
+
+void traceDraw(const char* fn, GLsizei count, GLint program) {
+    GLint fbo = 0, active = 0, viewport[4]{};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    char units[160]{};
+    int used = 0;
+    for (int unit = 0; unit < 4; ++unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        GLint tex2d = 0, cube = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex2d);
+        glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &cube);
+        used += std::snprintf(units + used, sizeof(units) - used, "u%d(2d=%d cube=%d) ", unit, tex2d, cube);
+    }
+    glActiveTexture(static_cast<GLenum>(active));
+    LOGI("trace %s prog=%d fbo=%d vp=%dx%d count=%d %s", fn, program, fbo, viewport[2], viewport[3], count, units);
 }
 
 enum class Begin { Ok, Retry, Fatal };
@@ -258,7 +287,7 @@ bool renderVideo() {
 }
 
 // Returns true when the game's own draw call must be skipped because it was the panorama.
-bool replacePanorama() {
+bool replacePanorama(int fn, GLsizei count) {
     if (!gEnabled.load(std::memory_order_relaxed) || gFailed) return false;
     if (!game::known() || !game::inMenu()) return false;
     if (!gStarted && Clock::now() < gNextRetry) return false;
@@ -266,6 +295,15 @@ bool replacePanorama() {
 
     GLint program = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    ++gDrawsInMenu[fn];
+    if (!gLoggedGl) {
+        gLoggedGl = true;
+        LOGI("GL: %s | %s", reinterpret_cast<const char*>(glGetString(GL_VERSION)), reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+    }
+    if (gTraceFrame) {
+        static const char* const names[] = {"glDrawElements", "glDrawArrays", "glDrawElementsInstanced", "glDrawArraysInstanced", "glDrawRangeElements"};
+        traceDraw(names[fn], count, program);
+    }
     if (!isCubemapProgram(static_cast<GLuint>(program))) return false;
 
     ++gCubemapDraws;
@@ -293,27 +331,27 @@ EGLBoolean (*gSwapOriginal)(EGLDisplay, EGLSurface) = nullptr;
 std::vector<hooks::Handle> gHandles;
 
 void drawElementsHook(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    if (replacePanorama()) return;
+    if (replacePanorama(0, count)) return;
     if (gDrawElementsOriginal) gDrawElementsOriginal(mode, count, type, indices);
 }
 
 void drawArraysHook(GLenum mode, GLint first, GLsizei count) {
-    if (replacePanorama()) return;
+    if (replacePanorama(1, count)) return;
     if (gDrawArraysOriginal) gDrawArraysOriginal(mode, first, count);
 }
 
 void drawElementsInstancedHook(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instances) {
-    if (replacePanorama()) return;
+    if (replacePanorama(2, count)) return;
     if (gDrawElementsInstancedOriginal) gDrawElementsInstancedOriginal(mode, count, type, indices, instances);
 }
 
 void drawArraysInstancedHook(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
-    if (replacePanorama()) return;
+    if (replacePanorama(3, count)) return;
     if (gDrawArraysInstancedOriginal) gDrawArraysInstancedOriginal(mode, first, count, instances);
 }
 
 void drawRangeElementsHook(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {
-    if (replacePanorama()) return;
+    if (replacePanorama(4, count)) return;
     if (gDrawRangeElementsOriginal) gDrawRangeElementsOriginal(mode, start, end, count, type, indices);
 }
 
@@ -338,6 +376,13 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     }
 
     const bool menu = game::known() && game::inMenu();
+    gTraceFrame = menu && (gMenuFrames == 300 || gMenuFrames == 301 || gMenuFrames == 302);
+    if (gMenuFrames == 300 && menu) LOGI("--- tracing 3 menu frames ---");
+    if ((gFrameCount % 600) == 0 && gFrameCount <= 18000) {
+        LOGI("stat frames=%ld known=%d inMenu=%d menuFrames=%ld draws[el=%ld ar=%ld elI=%ld arI=%ld rng=%ld] cubemapDraws=%ld started=%d failed=%d",
+            gFrameCount, game::known() ? 1 : 0, game::inMenu() ? 1 : 0, gMenuFrames, gDrawsInMenu[0], gDrawsInMenu[1],
+            gDrawsInMenu[2], gDrawsInMenu[3], gDrawsInMenu[4], gCubemapDraws, gStarted ? 1 : 0, gFailed ? 1 : 0);
+    }
     if (menu) {
         ++gMenuFrames;
         if (!gLoggedNoCubemap && gCubemapDraws == 0 && gMenuFrames > 600) {
@@ -375,15 +420,24 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     return gSwapOriginal ? gSwapOriginal(display, surface) : EGL_FALSE;
 }
 
-void hookSymbol(void* library, const char* name, void* detour, void** original) {
-    if (!library) return;
-    void* target = hooks::symbolFromLibrary("libGLESv2.so", name);
-    if (!target) {
-        LOGW("symbol not found: %s", name);
-        return;
+// Hooks an entry point in libGLESv2.so and, if it lives at a different address, in libGLESv3.so too.
+void hookGl(const char* name, void* detour, void** original) {
+    void* first = nullptr;
+    for (const char* library : {"libGLESv2.so", "libGLESv3.so"}) {
+        void* target = hooks::symbolFromLibrary(library, name);
+        if (!target) {
+            LOGW("%s: not exported by %s", name, library);
+            continue;
+        }
+        if (target == first) continue; // same function, already hooked
+        if (auto handle = hooks::install(target, detour, original)) {
+            gHandles.push_back(handle);
+            LOGI("hooked %s in %s", name, library);
+        } else {
+            LOGW("failed to hook %s in %s", name, library);
+        }
+        if (!first) first = target;
     }
-    if (auto handle = hooks::install(target, detour, original)) gHandles.push_back(handle);
-    else LOGW("failed to hook %s", name);
 }
 
 } // namespace
@@ -392,6 +446,8 @@ void setup(JavaVM* vm, const std::filesystem::path& resourceDir, const std::file
     Player::setJavaVm(vm);
     gResourceDir = resourceDir;
     gConfigDir = configDir;
+    log::setFile(configDir / "log.txt");
+    LOGI("BackgroundVideo 1.0.0 starting");
     readConfig();
     writeDefaultConfigIfMissing();
     LOGI("config file: %s", configFile().c_str());
@@ -408,14 +464,11 @@ bool installHooks() {
         LOGE("failed to hook eglSwapBuffers");
         return false;
     }
-    void* gles = dlopen("libGLESv2.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!gles) gles = dlopen("libGLESv2.so", RTLD_NOW);
-    hookSymbol(gles, "glDrawElements", reinterpret_cast<void*>(drawElementsHook), reinterpret_cast<void**>(&gDrawElementsOriginal));
-    hookSymbol(gles, "glDrawArrays", reinterpret_cast<void*>(drawArraysHook), reinterpret_cast<void**>(&gDrawArraysOriginal));
-    hookSymbol(gles, "glDrawElementsInstanced", reinterpret_cast<void*>(drawElementsInstancedHook), reinterpret_cast<void**>(&gDrawElementsInstancedOriginal));
-    hookSymbol(gles, "glDrawArraysInstanced", reinterpret_cast<void*>(drawArraysInstancedHook), reinterpret_cast<void**>(&gDrawArraysInstancedOriginal));
-    hookSymbol(gles, "glDrawRangeElements", reinterpret_cast<void*>(drawRangeElementsHook), reinterpret_cast<void**>(&gDrawRangeElementsOriginal));
-    if (gles) dlclose(gles);
+    hookGl("glDrawElements", reinterpret_cast<void*>(drawElementsHook), reinterpret_cast<void**>(&gDrawElementsOriginal));
+    hookGl("glDrawArrays", reinterpret_cast<void*>(drawArraysHook), reinterpret_cast<void**>(&gDrawArraysOriginal));
+    hookGl("glDrawElementsInstanced", reinterpret_cast<void*>(drawElementsInstancedHook), reinterpret_cast<void**>(&gDrawElementsInstancedOriginal));
+    hookGl("glDrawArraysInstanced", reinterpret_cast<void*>(drawArraysInstancedHook), reinterpret_cast<void**>(&gDrawArraysInstancedOriginal));
+    hookGl("glDrawRangeElements", reinterpret_cast<void*>(drawRangeElementsHook), reinterpret_cast<void**>(&gDrawRangeElementsOriginal));
     LOGI("hooks installed (%zu)", gHandles.size());
     return true;
 }
