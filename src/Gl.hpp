@@ -25,6 +25,8 @@ struct Renderer {
 
     bool create();
     void destroy();
+    // The GL context is gone: forget the ids without calling GL (they could name unrelated objects now).
+    void forget() { vbo = vao = texture = program = 0; }
     bool ready() const { return program != 0; }
     // Draws a centered quad covering [-sx, sx] x [-sy, sy] in clip space.
     void draw(float sx, float sy, float brightness, const float* texMatrix);

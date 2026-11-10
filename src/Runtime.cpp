@@ -76,6 +76,7 @@ bool Runtime::enable(pl::mod::ModContext&) {
     gEnabled.store(true, std::memory_order_release);
     video::setEnabled(true);
     video::installHooks();
+    video::preload(); // start opening the video now, while Minecraft is still starting
     if (minecraftAlreadyLoaded()) {
         installGameHooks();
     } else if (!gDlopenHook) {

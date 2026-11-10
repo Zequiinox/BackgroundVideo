@@ -12,6 +12,9 @@ void setup(JavaVM* vm, const std::filesystem::path& resourceDir, const std::file
 bool installHooks();
 void removeHooks();
 
+// Opens the video on a background thread so it is ready by the time the menu shows.
+void preload();
+
 void setEnabled(bool enabled);
 
 }

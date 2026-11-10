@@ -1,7 +1,6 @@
 #include "Player.hpp"
 #include "Log.hpp"
 
-
 namespace bgv {
 namespace {
 
@@ -37,7 +36,11 @@ void Player::setJavaVm(JavaVM* vm) {
     gVm = vm;
 }
 
-bool Player::start(const std::string& path, unsigned int texture, float volume, bool loop) {
+void Player::detachThread() {
+    if (gVm) gVm->DetachCurrentThread();
+}
+
+bool Player::prepare(const std::string& path, float volume, bool loop) {
     JNIEnv* env = currentEnv();
     if (!env) return false;
 
@@ -58,10 +61,14 @@ bool Player::start(const std::string& path, unsigned int texture, float volume, 
         javaOk(env, name);
         return id;
     };
-    const jmethodID stCtor = method(mSurfaceTextureClass, "<init>", "(I)V");
+    // SurfaceTexture(boolean) creates the texture detached from any GL context (Android 8+),
+    // so the video can be opened long before the game has a GL context.
+    const jmethodID stCtor = method(mSurfaceTextureClass, "<init>", "(Z)V");
     const jmethodID surfaceCtor = method(mSurfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
     const jmethodID playerCtor = method(mPlayerClass, "<init>", "()V");
+    mAttachToGlContext = method(mSurfaceTextureClass, "attachToGLContext", "(I)V");
     mUpdateTexImage = method(mSurfaceTextureClass, "updateTexImage", "()V");
+    mGetTimestamp = method(mSurfaceTextureClass, "getTimestamp", "()J");
     mGetTransformMatrix = method(mSurfaceTextureClass, "getTransformMatrix", "([F)V");
     mSurfaceTextureRelease = method(mSurfaceTextureClass, "release", "()V");
     mSurfaceRelease = method(mSurfaceClass, "release", "()V");
@@ -69,21 +76,20 @@ bool Player::start(const std::string& path, unsigned int texture, float volume, 
     const jmethodID setSurface = method(mPlayerClass, "setSurface", "(Landroid/view/Surface;)V");
     const jmethodID setVolume = method(mPlayerClass, "setVolume", "(FF)V");
     const jmethodID setLooping = method(mPlayerClass, "setLooping", "(Z)V");
-    const jmethodID prepare = method(mPlayerClass, "prepare", "()V");
+    const jmethodID prepareMethod = method(mPlayerClass, "prepare", "()V");
     mPlayerStart = method(mPlayerClass, "start", "()V");
     mPlayerPause = method(mPlayerClass, "pause", "()V");
     mPlayerStop = method(mPlayerClass, "stop", "()V");
     mPlayerRelease = method(mPlayerClass, "release", "()V");
-    mGetPosition = method(mPlayerClass, "getCurrentPosition", "()I");
     const jmethodID getDuration = method(mPlayerClass, "getDuration", "()I");
     const jmethodID getVideoWidth = method(mPlayerClass, "getVideoWidth", "()I");
     const jmethodID getVideoHeight = method(mPlayerClass, "getVideoHeight", "()I");
-    if (!stCtor || !surfaceCtor || !playerCtor || !mUpdateTexImage || !mGetTransformMatrix || !setDataSource
-        || !setSurface || !prepare || !mPlayerStart || !mPlayerPause || !mGetPosition) {
-        return fail(env, "method lookup");
+    if (!stCtor || !surfaceCtor || !playerCtor || !mAttachToGlContext || !mUpdateTexImage || !mGetTimestamp
+        || !mGetTransformMatrix || !setDataSource || !setSurface || !prepareMethod || !mPlayerStart || !mPlayerPause) {
+        return fail(env, "method lookup (needs Android 8+)");
     }
 
-    jobject st = env->NewObject(mSurfaceTextureClass, stCtor, static_cast<jint>(texture));
+    jobject st = env->NewObject(mSurfaceTextureClass, stCtor, JNI_FALSE);
     if (!st || !javaOk(env, "SurfaceTexture")) return fail(env, "SurfaceTexture");
     mSurfaceTexture = env->NewGlobalRef(st);
     env->DeleteLocalRef(st);
@@ -107,7 +113,7 @@ bool Player::start(const std::string& path, unsigned int texture, float volume, 
     if (setLooping) env->CallVoidMethod(mPlayer, setLooping, loop ? JNI_TRUE : JNI_FALSE);
     if (setVolume) env->CallVoidMethod(mPlayer, setVolume, volume, volume);
     javaOk(env, "volume/looping");
-    env->CallVoidMethod(mPlayer, prepare);
+    env->CallVoidMethod(mPlayer, prepareMethod); // blocks; this is why it runs on a helper thread
     if (!javaOk(env, "prepare")) return fail(env, "prepare");
 
     mDuration = getDuration ? env->CallIntMethod(mPlayer, getDuration) : 0;
@@ -118,11 +124,19 @@ bool Player::start(const std::string& path, unsigned int texture, float volume, 
     jfloatArray matrix = env->NewFloatArray(16);
     mMatrix = static_cast<jfloatArray>(env->NewGlobalRef(matrix));
     env->DeleteLocalRef(matrix);
-
-    env->CallVoidMethod(mPlayer, mPlayerStart);
-    if (!javaOk(env, "start")) return fail(env, "start");
     mPaused = false;
-    LOGI("video started (%dx%d, %d ms)", mWidth, mHeight, mDuration);
+    LOGI("video prepared (%dx%d, %d ms)", mWidth, mHeight, mDuration);
+    return true;
+}
+
+bool Player::attachAndStart(unsigned int texture) {
+    JNIEnv* env = currentEnv();
+    if (!env || !mPlayer || !mSurfaceTexture) return false;
+    env->CallVoidMethod(mSurfaceTexture, mAttachToGlContext, static_cast<jint>(texture));
+    if (!javaOk(env, "attachToGLContext")) return false;
+    env->CallVoidMethod(mPlayer, mPlayerStart);
+    if (!javaOk(env, "start")) return false;
+    mPaused = false;
     return true;
 }
 
@@ -135,6 +149,14 @@ bool Player::update(float matrix[16]) {
     if (!javaOk(env, "getTransformMatrix")) return false;
     env->GetFloatArrayRegion(mMatrix, 0, 16, matrix);
     return true;
+}
+
+bool Player::frameReady() {
+    JNIEnv* env = currentEnv();
+    if (!env || !mSurfaceTexture) return false;
+    const jlong timestamp = env->CallLongMethod(mSurfaceTexture, mGetTimestamp);
+    javaOk(env, "getTimestamp");
+    return timestamp > 0;
 }
 
 void Player::pause() {
@@ -151,14 +173,6 @@ void Player::resume() {
     env->CallVoidMethod(mPlayer, mPlayerStart);
     javaOk(env, "resume");
     mPaused = false;
-}
-
-int Player::position() {
-    JNIEnv* env = currentEnv();
-    if (!env || !mPlayer) return 0;
-    const int pos = env->CallIntMethod(mPlayer, mGetPosition);
-    javaOk(env, "getCurrentPosition");
-    return pos;
 }
 
 void Player::release() {

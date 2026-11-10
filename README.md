@@ -17,7 +17,10 @@ In 26.x the menu buttons are a separate HTML-based UI drawn on top of a native c
 3. Menu detection reuses two BedrockTools signatures (`ClientInstance::update` and `getLocalPlayer`),
    which all match exactly once in the 26.62 `libminecraftpe.so`.
 4. Decoding and optional audio use Android's `MediaPlayer` over JNI, so any mp4 the phone can play works.
-5. The video loops while the menu shows and pauses when you join a world.
+5. The video is opened on a background thread while Minecraft is still starting (so it is ready when the menu appears,
+   and the render thread is never blocked), loops while the menu shows, and pauses when you join a world.
+6. If the app goes to the background and comes back, Android destroys the GL context; the mod notices the new context
+   and restarts the video in it.
 
 If the video is missing or anything fails, the mod steps aside and the normal panorama is shown.
 
@@ -56,6 +59,7 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 | `volume` | `0.0` | 0.0 (muted) to 1.0 |
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
 | `brightness` | `1.0` | Lower it to dim the video if menu text is hard to read |
+| `debug_trace` | `false` | Logs every draw call of three menu frames to `log.txt` (only for bug reports) |
 
 ## Troubleshooting
 
@@ -69,4 +73,5 @@ The same lines go to logcat under the tag `BackgroundVideo`.
 - `in menu ... but the panorama was never recognised`: the first draws of a menu frame do not look like six face quads; the trace in `log.txt` shows how the frame is drawn.
 - `learned panorama faces: ...` means the six face textures were found.
 - `cannot read a video at ...`: the path in `video_path` is wrong, or the launcher has no storage access to that file.
-- Use an unrotated, H.264 mp4 at or below your screen resolution for the smoothest result.
+- For the smoothest result use an unrotated H.264 mp4 at 1080p or lower, 30 fps, around 4-8 Mbps. Very high resolutions or bitrates cost battery and can stutter on weaker phones.
+- Needs Android 8 or newer (the video is opened before the game has a GL context).

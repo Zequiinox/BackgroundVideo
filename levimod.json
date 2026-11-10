@@ -5,7 +5,7 @@
   "minecraft_versions": ["26.62"],
   "info": {
     "name": "BackgroundVideo",
-    "author": "Your Name",
+    "author": "Zequiinox",
     "description": "Plays your own video as the main menu background instead of the panorama.",
     "tags": ["Visual"]
   },
