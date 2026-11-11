@@ -28,6 +28,7 @@ public:
     void pause();
     void resume();
     void release();
+    void setVolume(float volume); // 0..1, safe from any thread
 
     bool active() const { return mPlayer != nullptr; }
     bool paused() const { return mPaused.load(); }
@@ -56,6 +57,7 @@ private:
     jmethodID mPlayerRelease = nullptr;
     jmethodID mPlayerPause = nullptr;
     jmethodID mPlayerStart = nullptr;
+    jmethodID mPlayerSetVolume = nullptr;
     int mDuration = 0;
     int mWidth = 0;
     int mHeight = 0;

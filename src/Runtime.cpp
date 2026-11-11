@@ -2,6 +2,7 @@
 #include "BackgroundVideo.hpp"
 #include "Game.hpp"
 #include "Hooks.hpp"
+#include "MenuUi.hpp"
 #include <android/log.h>
 #include <atomic>
 #include <cstring>
@@ -71,11 +72,12 @@ bool Runtime::load(pl::mod::ModContext& context) {
     return true;
 }
 
-bool Runtime::enable(pl::mod::ModContext&) {
+bool Runtime::enable(pl::mod::ModContext& context) {
     if (!launcherContext()) return true;
     gEnabled.store(true, std::memory_order_release);
     video::setEnabled(true);
     video::installHooks();
+    menu::registerMenu(context.id()); // before preload, so saved menu values apply first
     video::preload(); // start opening the video now, while Minecraft is still starting
     if (minecraftAlreadyLoaded()) {
         installGameHooks();
@@ -95,6 +97,7 @@ bool Runtime::disable(pl::mod::ModContext&) {
 bool Runtime::unload(pl::mod::ModContext&) {
     gEnabled.store(false, std::memory_order_release);
     video::setEnabled(false);
+    menu::unregisterMenu();
     video::removeHooks();
     game::uninstall();
     if (gDlopenHook) {

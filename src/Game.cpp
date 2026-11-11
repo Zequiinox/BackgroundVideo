@@ -35,7 +35,7 @@ void* updateDetour(void* clientInstance, bool value) {
 bool install() {
     if (gInstalled.load(std::memory_order_acquire)) return true;
     if (!signatures::resolveAll("libminecraftpe.so")) {
-        LOGE("signatures not found - this Minecraft build is not supported, menu detection disabled");
+        LOGE("ClientInstance vtable not resolved (RTTI missing or slot indexes changed) - menu detection disabled");
         return false;
     }
     gGetLocalPlayer = reinterpret_cast<LocalPlayerFn>(signatures::resolve(signatures::Id::ClientInstanceGetLocalPlayer));

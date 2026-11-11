@@ -13,6 +13,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -30,7 +31,6 @@ using Clock = std::chrono::steady_clock;
 struct Config {
     std::string videoPath;                // full path to a video or an image (png/jpg/webp/bmp/gif); defaults to <config folder>/menu.mp4
     std::string video = "menu.mp4";       // used only when video_path is empty: looked up in the config/resources folder
-    float volume = 0.0f;                  // 0.0 (muted) - 1.0
     std::string fit = "cover";            // "cover" fills the screen (crops), "contain" shows black bars
     float brightness = 1.0f;              // 0.0 - 1.0, lower it if the menu text is hard to read
     bool debugTrace = false;              // log every draw call of three menu frames (for bug reports)
@@ -39,6 +39,16 @@ struct Config {
 std::filesystem::path gResourceDir;
 std::filesystem::path gConfigDir;
 Config gConfig;
+
+std::atomic_bool gAudioOn{true};
+std::atomic<float> gAudioVolume{1.0f};
+std::atomic_bool gAudioDirty{false};
+std::atomic<long long> gAudioChangedMs{0};
+float gAppliedVolume = -1.0f; // render thread only
+
+float effectiveVolume() {
+    return gAudioOn.load() ? std::clamp(gAudioVolume.load(), 0.0f, 1.0f) : 0.0f;
+}
 std::filesystem::file_time_type gConfigTime{};
 
 bool readable(const std::filesystem::path& path) {
@@ -93,13 +103,46 @@ void readConfig() {
     };
     read("video_path", gConfig.videoPath);
     read("video", gConfig.video);
-    read("volume", gConfig.volume);
     read("fit", gConfig.fit);
     read("brightness", gConfig.brightness);
     read("debug_trace", gConfig.debugTrace);
-    gConfig.volume = std::clamp(gConfig.volume, 0.0f, 1.0f);
     gConfig.brightness = std::clamp(gConfig.brightness, 0.0f, 1.0f);
     if (gConfig.fit != "cover" && gConfig.fit != "contain") gConfig.fit = "cover";
+    
+    if (!gAudioDirty.load()) { // do not clobber a pending menu change
+        bool audioOn = true;
+        float audioVolume = 1.0f;
+        try { if (j.contains("audio_enabled")) audioOn = j["audio_enabled"].get<bool>(); } catch (...) {}
+        try { if (j.contains("audio_volume")) audioVolume = j["audio_volume"].get<float>(); } catch (...) {}
+        gAudioOn.store(audioOn);
+        gAudioVolume.store(std::clamp(audioVolume, 0.0f, 1.0f));
+    }
+    
+}
+
+// Merges the audio settings into the existing config.json (other keys are kept).
+void saveAudioConfig() {
+    nlohmann::json j = nlohmann::json::object();
+    {
+        std::ifstream in(configFile());
+        if (in) {
+            auto parsed = nlohmann::json::parse(in, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) j = std::move(parsed);
+        }
+    }
+    j["audio_enabled"] = gAudioOn.load();
+    j["audio_volume"] = std::round(gAudioVolume.load() * 100.0f) / 100.0f;
+    std::error_code ec;
+    std::filesystem::create_directories(gConfigDir, ec);
+    {
+        std::ofstream out(configFile());
+        if (!out) {
+            LOGW("could not save %s", configFile().c_str());
+            return;
+        }
+        out << j.dump(2) << "\n";
+    }
+    gConfigTime = std::filesystem::last_write_time(configFile(), ec); // our own write must not trigger a hot reload
 }
 
 // Creates config.json with defaults only if it does not exist yet. A failure here is harmless.
@@ -109,10 +152,11 @@ void writeDefaultConfigIfMissing() {
     nlohmann::json out = {
         {"video_path", gConfig.videoPath},
         {"video", gConfig.video},
-        {"volume", gConfig.volume},
         {"fit", gConfig.fit},
         {"brightness", gConfig.brightness},
         {"debug_trace", gConfig.debugTrace},
+        {"audio_enabled", gAudioOn.load()},
+        {"audio_volume", gAudioVolume.load()},
     };
     std::filesystem::create_directories(gConfigDir, ec);
     std::ofstream file(configFile());
@@ -224,7 +268,7 @@ void startPrepare(const std::filesystem::path& path) {
     gPrepImage = isImagePath(path);
     const bool image = gPrepImage;
     const std::string file = path.string();
-    const float volume = gConfig.volume;
+    const float volume = effectiveVolume();
     LOGI("preparing %s %s in the background", image ? "image" : "video", file.c_str());
     std::thread([file, volume, image] {
         const bool ok = image ? gImage.load(file, 2048) : gPlayer.prepare(file, volume, true);
@@ -425,6 +469,7 @@ bool attachPlayback() {
     gLoadedTime = gPrepTime;
     gContext = eglGetCurrentContext();
     gStarted = true;
+    gAppliedVolume = -1.0f; // force re-apply
     gFirstFrame = gPrepImage; // an image has its "frame" right away
     gRetries = 0;
     LOGI("showing %s %s", gPrepImage ? "image" : "video", gLoadedPath.c_str());
@@ -589,6 +634,14 @@ void drawRangeElementsHook(GLenum mode, GLuint start, GLuint end, GLsizei count,
     if (gDrawRangeElementsOriginal) gDrawRangeElementsOriginal(mode, start, end, count, type, indices);
 }
 
+void applyVolume() {
+    if (!gStarted.load() || gIsImage.load()) return;
+    const float v = effectiveVolume();
+    if (v == gAppliedVolume) return;
+    gAppliedVolume = v;
+    gPlayer.setVolume(v);
+}
+
 EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     // End of frame: bookkeeping on the render thread (its GL context is current here).
     gLastSwapMs.store(nowMs());
@@ -601,6 +654,12 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
 
     const EGLContext context = eglGetCurrentContext();
     const bool ownContext = gContext == EGL_NO_CONTEXT || context == gContext;
+    if (ownContext) applyVolume();
+    
+    if (gAudioDirty.load() && nowMs() - gAudioChangedMs.load() > 500) { // slider drag = many events, write once
+        gAudioDirty = false;
+        saveAudioConfig();
+    }
 
     // The app was sent to the background and came back: Android destroyed our GL context and made a new one.
     // Keep the same MediaPlayer (so the video continues where it was) and just move it to the new context.
@@ -761,6 +820,7 @@ bool installHooks() {
 }
 
 void removeHooks() {
+    if (gAudioDirty.exchange(false)) saveAudioConfig();
     gWatchdogRun = false;
     for (auto handle : gHandles) hooks::remove(handle);
     gHandles.clear();
@@ -778,5 +838,20 @@ void setEnabled(bool enabled) {
     gEnabled.store(enabled, std::memory_order_release);
     if (!enabled) gReleaseRequested.store(true, std::memory_order_release);
 }
+
+void setAudioEnabled(bool enabled) {
+    gAudioOn.store(enabled);
+    gAudioChangedMs.store(nowMs());
+    gAudioDirty.store(true);
+}
+
+void setAudioVolume(float volume) {
+    gAudioVolume.store(std::clamp(volume, 0.0f, 1.0f));
+    gAudioChangedMs.store(nowMs());
+    gAudioDirty.store(true);
+}
+
+bool audioEnabled() { return gAudioOn.load(); }
+float audioVolume() { return gAudioVolume.load(); }
 
 } // namespace bgv::video

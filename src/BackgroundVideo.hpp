@@ -16,5 +16,9 @@ void removeHooks();
 void preload();
 
 void setEnabled(bool enabled);
+void setAudioEnabled(bool enabled);
+void setAudioVolume(float volume);
+bool audioEnabled();
+float audioVolume();
 
 }

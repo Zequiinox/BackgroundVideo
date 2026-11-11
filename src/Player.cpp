@@ -74,7 +74,7 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     mSurfaceRelease = method(mSurfaceClass, "release", "()V");
     const jmethodID setDataSource = method(mPlayerClass, "setDataSource", "(Ljava/lang/String;)V");
     mSetSurface = method(mPlayerClass, "setSurface", "(Landroid/view/Surface;)V");
-    const jmethodID setVolume = method(mPlayerClass, "setVolume", "(FF)V");
+    mPlayerSetVolume = method(mPlayerClass, "setVolume", "(FF)V");
     const jmethodID setLooping = method(mPlayerClass, "setLooping", "(Z)V");
     const jmethodID prepareMethod = method(mPlayerClass, "prepare", "()V");
     mPlayerStart = method(mPlayerClass, "start", "()V");
@@ -111,7 +111,7 @@ bool Player::prepare(const std::string& path, float volume, bool loop) {
     env->CallVoidMethod(mPlayer, mSetSurface, mSurface);
     if (!javaOk(env, "setSurface")) return fail(env, "setSurface");
     if (setLooping) env->CallVoidMethod(mPlayer, setLooping, loop ? JNI_TRUE : JNI_FALSE);
-    if (setVolume) env->CallVoidMethod(mPlayer, setVolume, volume, volume);
+    if (mPlayerSetVolume) env->CallVoidMethod(mPlayer, mPlayerSetVolume, volume, volume);
     javaOk(env, "volume/looping");
     env->CallVoidMethod(mPlayer, prepareMethod); // blocks; this is why it runs on a helper thread
     if (!javaOk(env, "prepare")) return fail(env, "prepare");
@@ -222,6 +222,14 @@ void Player::resume() {
     env->CallVoidMethod(mPlayer, mPlayerStart);
     javaOk(env, "resume");
     mPaused = false;
+}
+
+void Player::setVolume(float volume) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    JNIEnv* env = currentEnv();
+    if (!env || !mPlayer || !mPlayerSetVolume) return;
+    env->CallVoidMethod(mPlayer, mPlayerSetVolume, volume, volume);
+    javaOk(env, "setVolume");
 }
 
 void Player::release() {
