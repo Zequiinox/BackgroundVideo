@@ -14,9 +14,10 @@ In 26.x the menu buttons are a separate HTML-based UI drawn on top of a native c
    its own 2D texture (the six cube faces). The mod learns those six texture ids from the start of each menu frame, then
    skips exactly those draws and draws the video in their place, so the buttons still sit on top. (If a build uses a real
    cube map sampler instead, that is detected as well.)
-3. Menu detection reuses two BedrockTools signatures (`ClientInstance::update` and `getLocalPlayer`),
-   which all match exactly once in the 26.62 `libminecraftpe.so`.
-4. Decoding and optional audio use Android's `MediaPlayer` over JNI, so any mp4 the phone can play works.
+3. Menu detection reads the `ClientInstance` vtable (RTTI name `14ClientInstance`, slot 24 = `update`, slot 31 =
+   `getLocalPlayer`), the same way BedrockTools resolves other virtual functions. Both slots point at exactly the same
+   functions as the old byte-pattern signatures did on 26.62, but vtable slots survive recompiles better than byte patterns.
+4. Decoding and audio use Android's `MediaPlayer` over JNI, so any mp4 the phone can play works.
 5. The video is opened on a background thread while Minecraft is still starting (so it is ready when the menu appears,
    and the render thread is never blocked), loops while the menu shows, and pauses when you join a world.
 6. When the app goes to the background the video is paused (a small watchdog notices that frames stopped). Android
@@ -65,10 +66,30 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 | --- | --- | --- |
 | `video_path` | `<config folder>/menu.mp4` | Full path to your video or image |
 | `video` | `menu.mp4` | Used only when `video_path` is empty: file name in the config folder |
-| `volume` | `0.0` | 0.0 (muted) to 1.0 |
+| `audio_enabled` | `true` | Play the video's sound (also a toggle in the in-game mod menu) |
+| `audio_volume` | `1.0` | 0.0 to 1.0 (also a slider in the in-game mod menu) |
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
 | `brightness` | `1.0` | Lower it to dim the video if menu text is hard to read |
 | `debug_trace` | `false` | Logs every draw call of three menu frames to `log.txt` (only for bug reports) |
+
+## In-game settings
+
+The mod registers a **Menu Video Background** module in the LeviLauncher mod menu: a master toggle for the whole mod, a
+**Video audio** toggle and a **Volume** slider. Changes apply live and are saved back into `config.json`
+(`audio_enabled`, `audio_volume`); other keys in the file are kept.
+
+## UI / theme packs
+
+The mod replaces the *native panorama*. Resource packs that restyle the menu normally still work, because the buttons and
+overlays they draw come after the panorama. A pack that draws its **own full-screen background image** on the start
+screen (some big UI themes do) puts that image on top of the panorama spot, so you will see the pack's image instead of
+the video. Turn that background off in the pack, or use one or the other.
+
+The panorama is only recognised as the very first six quads of a menu frame (confirmed over two frames in a row), so
+extra things a pack draws on the menu are never mistaken for it.
+
+If a pack still misbehaves, set `"debug_trace": true` in `config.json`, open the menu with the pack enabled, and send
+`log.txt`: it records what the menu draws, frame by frame.
 
 ## Troubleshooting
 
@@ -78,7 +99,7 @@ three menu frames, and a stat line every ~10 seconds. Send it along when reporti
 The same lines go to logcat under the tag `BackgroundVideo`.
 
 - `panorama replaced by video` means it is working.
-- `signatures not found`: this Minecraft build changed the two functions; the patterns in `src/Signatures.cpp` need updating.
+- `ClientInstance vtable not resolved`: RTTI is missing or the slot numbers changed in this Minecraft build; check `kSlotUpdate` / `kSlotGetLocalPlayer` in `src/Signatures.cpp`.
 - `in menu ... but the panorama was never recognised`: the first draws of a menu frame do not look like six face quads; the trace in `log.txt` shows how the frame is drawn.
 - `learned panorama faces: ...` means the six face textures were found.
 - `cannot read a video at ...`: the path in `video_path` is wrong, or the launcher has no storage access to that file.

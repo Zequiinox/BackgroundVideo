@@ -184,6 +184,13 @@ EGLContext gContext = EGL_NO_CONTEXT;
 std::atomic_bool gStarted{false}; // attached to the GL context and playing (read by the watchdog thread)
 bool gFirstFrame = false;    // a decoded frame has been latched at least once
 bool gFailed = false;        // unrecoverable (shader problem)
+// Our own draw calls go through the same hooked GL functions. While we draw, the hooks must ignore them, otherwise they
+// are counted as the game's draws and break the "first six draws of the frame" panorama detection.
+bool gSelfDraw = false;
+struct SelfDrawGuard {
+    SelfDrawGuard() { gSelfDraw = true; }
+    ~SelfDrawGuard() { gSelfDraw = false; }
+};
 bool gFrameHandled = false;  // we already decided what to do with the panorama this frame
 bool gFrameShown = false;    // ...and we drew the video this frame
 int gUpdateFailures = 0;
@@ -326,42 +333,50 @@ bool isPanoramaTexture(GLint texture) {
     return std::find(gPanoTextures.begin(), gPanoTextures.end(), texture) != gPanoTextures.end();
 }
 
-// Six quads in a row with the same program and six different textures are the panorama faces. The run may start
-// anywhere in the first draws of a menu frame (the game can draw something before it, e.g. a fade quad), but it
-// must be exactly six long, so a row of UI icons is not mistaken for it.
-bool commitRun() {
-    if (gLearning.size() != 6) return false;
+// The native panorama screen is the bottom-most screen, so its six face quads are always the very first six draws of
+// a menu frame: six quads in a row, same program, six different textures. Anything a UI pack draws itself (full-screen
+// backgrounds, tiles, icon rows) comes after them and must never be mistaken for the panorama, so a run only counts if it
+// starts at the first draw of the frame, is exactly six long, and shows up unchanged in two frames in a row.
+std::vector<GLint> gCandidate; // the run seen in the previous frame
+
+// The six distinct texture ids (sorted) of the finished leading run, or empty if it is not a valid panorama run.
+std::vector<GLint> finishedRun() {
+    if (gLearning.size() != 6) return {};
     std::vector<GLint> unique = gLearning;
     std::sort(unique.begin(), unique.end());
     unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
-    if (unique.size() != 6 || unique.front() <= 0) return false;
-    if (unique != gPanoTextures) {
-        gPanoTextures = unique;
-        LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", gLearnProgram,
-            unique[0], unique[1], unique[2], unique[3], unique[4], unique[5]);
+    if (unique.size() != 6 || unique.front() <= 0) return {};
+    return unique;
+}
+
+void judgeRun(const std::vector<GLint>& run) {
+    if (run.empty()) {
+        gCandidate.clear();
+        return;
     }
-    return true;
+    if (run == gPanoTextures) {
+        gCandidate = run;
+    } else if (run == gCandidate) { // same run two frames in a row: accept it
+        gPanoTextures = run;
+        LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", gLearnProgram,
+            run[0], run[1], run[2], run[3], run[4], run[5]);
+    } else {
+        gCandidate = run;
+    }
 }
 
 void learnPanorama(GLint program, GLsizei count, int index) {
     if (!gLearnOpen) return;
     const bool quad = count == 6;
-    if (quad && (gLearning.empty() || program == gLearnProgram)) {
+    if (quad && (gLearning.empty() ? index == 0 : program == gLearnProgram)) {
         if (gLearning.empty()) gLearnProgram = program;
-        gLearning.push_back(texture0());
-    } else {
-        if (commitRun()) gLearnOpen = false; // a finished run of exactly six different textures
-        gLearning.clear();
-        if (quad && gLearnOpen) { // this quad starts a new run
-            gLearnProgram = program;
-            gLearning.push_back(texture0());
-        }
+        gLearning.push_back(texture0()); // the run continues
+        return;
     }
-    if (gLearnOpen && index + 1 >= kLeadingDraws) { // end of the window
-        commitRun();
-        gLearnOpen = false;
-        gLearning.clear();
-    }
+    // The run (if there was one) just ended, or the frame did not start with a quad at all.
+    gLearnOpen = false;
+    judgeRun(finishedRun());
+    gLearning.clear();
 }
 
 // Fallback for builds that draw the panorama with a real cube map sampler.
@@ -478,6 +493,7 @@ bool attachPlayback() {
 
 // Draws the video into the current render target, exactly where the panorama would have gone.
 bool renderVideo() {
+    SelfDrawGuard selfDraw;
     if (!gStarted && !startupStep()) return false; // still preparing: no GL work, the panorama stays
 
     gl::SavedState saved;
@@ -548,6 +564,7 @@ bool renderVideo() {
 
 // Returns true when the game's own draw call must be skipped because it was part of the panorama.
 bool replacePanorama(int fn, GLsizei count) {
+    if (gSelfDraw) return false; // our own video draw
     if (!gEnabled.load(std::memory_order_relaxed) || gFailed) return false;
     // The panorama is on screen in the main menu, but also behind other menu-like screens such as Profile, where the
     // game can have a local player (so "no local player" is not a reliable signal). Once the panorama has been seen,
@@ -648,6 +665,7 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     ++gFrameCount;
     gFrameHandled = false;
     gFrameShown = false;
+    if (gLearnOpen && !gLearning.empty()) judgeRun(finishedRun());
     gFrameDraws = 0;
     gLearnOpen = true;
     gLearning.clear();
