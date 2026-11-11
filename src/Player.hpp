@@ -66,4 +66,24 @@ private:
     jmethodID mSetSurface = nullptr;
 };
 
+
+// A still image decoded with Android's BitmapFactory and uploaded with GLUtils.
+//  - load() may run on any thread.
+//  - upload() must run on the GL thread, with the target GL_TEXTURE_2D texture bound on the active unit.
+class Image {
+public:
+    bool load(const std::string& path, int maxSize);
+    bool upload();
+    void release();
+
+    bool loaded() const { return mBitmap != nullptr; }
+    int width() const { return mWidth; }
+    int height() const { return mHeight; }
+
+private:
+    jobject mBitmap = nullptr;
+    int mWidth = 0;
+    int mHeight = 0;
+};
+
 }

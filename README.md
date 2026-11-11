@@ -1,6 +1,6 @@
 # BackgroundVideo
 
-A native mod for [LeviLaunchroid](https://github.com/LiteLDev/LeviLaunchroid) that plays your own video
+A native mod for [LeviLaunchroid](https://github.com/LiteLDev/LeviLaunchroid) that plays your own video (or shows one image)
 as the main menu background **instead of the Minecraft panorama**.
 Built for Minecraft Bedrock 26.62, Android arm64-v8a.
 
@@ -38,19 +38,23 @@ xmake f -y -p android -a arm64-v8a -m release --ndk=/path/to/android-ndk-r28c
 xmake -y
 ```
 
-2. Put your video anywhere on the phone and open the mod's `config.json` (in the mod's config folder; created with defaults on first run).
-   Set `video_path` to the video's full path:
+2. Copy your video or image to the mod's config folder as `menu.mp4` (that is the default `video_path`), or put it anywhere
+   on the phone and set `video_path` in `config.json` to its full path:
 
 ```json
 {
-  "video_path": "/storage/emulated/0/Movies/menu.mp4"
+  "video_path": "/storage/emulated/0/Android/media/org.levimc.launcher/minecraft/com.mojang.minecraftpe/mods/BackgroundVideo/config/menu.mp4"
 }
 ```
 
-3. Open the main menu. Changing `video_path`, or replacing the video file, is picked up automatically within a
+   **Images:** if `video_path` ends in `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp` or `.gif`, that image is shown as a still
+   background instead of a video (a GIF shows its first frame). Images larger than 2048 px are scaled down.
+3. Open the main menu. Changing `video_path`, or replacing the file, is picked up automatically within a
    couple of seconds, with no rebuild or restart.
 
-The mod only needs permission to *read* the video. If `video_path` is empty it looks for `background.mp4`
+In a world there is no menu background, so nothing is shown there; the video is back as soon as you return to the menu.
+
+The mod only needs permission to *read* the video. If `video_path` is empty it looks for the file named in `video` (default `menu.mp4`)
 in the config folder instead.
 
 Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
@@ -59,8 +63,8 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `video_path` | `""` | Full path to your video file |
-| `video` | `background.mp4` | Used only when `video_path` is empty: file name in the config folder |
+| `video_path` | `<config folder>/menu.mp4` | Full path to your video or image |
+| `video` | `menu.mp4` | Used only when `video_path` is empty: file name in the config folder |
 | `volume` | `0.0` | 0.0 (muted) to 1.0 |
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
 | `brightness` | `1.0` | Lower it to dim the video if menu text is hard to read |

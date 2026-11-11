@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -27,8 +28,8 @@ using Clock = std::chrono::steady_clock;
 // Config (<configDir>/config.json, created with defaults on first run)
 // ---------------------------------------------------------------------------
 struct Config {
-    std::string videoPath;                // full path to your video, e.g. /storage/emulated/0/Movies/menu.mp4
-    std::string video = "background.mp4"; // used only when video_path is empty: looked up in the config/resources folder
+    std::string videoPath;                // full path to a video or an image (png/jpg/webp/bmp/gif); defaults to <config folder>/menu.mp4
+    std::string video = "menu.mp4";       // used only when video_path is empty: looked up in the config/resources folder
     float volume = 0.0f;                  // 0.0 (muted) - 1.0
     std::string fit = "cover";            // "cover" fills the screen (crops), "contain" shows black bars
     float brightness = 1.0f;              // 0.0 - 1.0, lower it if the menu text is hard to read
@@ -106,7 +107,7 @@ void writeDefaultConfigIfMissing() {
     std::error_code ec;
     if (std::filesystem::exists(configFile(), ec)) return;
     nlohmann::json out = {
-        {"video_path", ""},
+        {"video_path", gConfig.videoPath},
         {"video", gConfig.video},
         {"volume", gConfig.volume},
         {"fit", gConfig.fit},
@@ -129,6 +130,9 @@ std::atomic_bool gReleaseRequested{false};
 enum Prep : int { PrepNone = 0, PrepBusy = 1, PrepReady = 2, PrepFailed = 3 };
 std::atomic<int> gPrep{PrepNone};
 std::atomic_bool gDiscard{false}; // release the player as soon as the helper thread is done
+bool gPrepImage = false;          // the file being prepared is an image (written before the helper thread starts)
+std::atomic_bool gIsImage{false}; // the current media is a still image (read by the watchdog thread)
+Image gImage;
 
 Player gPlayer;
 gl::Renderer gRenderer;
@@ -167,11 +171,12 @@ std::unordered_map<GLuint, bool> gProgramCache;
 
 // On this build the panorama is six separate quads (index count 6), each with its own 2D texture, and they are
 // the first draws of every menu frame. The mod learns those six texture ids from the start of each menu frame.
-constexpr int kLeadingDraws = 12;
+constexpr int kLeadingDraws = 16; // the panorama is always among the first draws of a menu frame
 std::vector<GLint> gPanoTextures;
 std::vector<GLint> gLearning;
 GLint gLearnProgram = 0;
 int gFrameDraws = 0;
+int gNoPanoFrames = 0;
 bool gLearnOpen = true;
 
 long long nowMs() {
@@ -186,13 +191,24 @@ void startWatchdog() {
         while (gWatchdogRun.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             const long long last = gLastSwapMs.load();
-            if (last > 0 && gStarted.load() && !gPlayer.paused() && nowMs() - last > 1000) {
+            if (last > 0 && gStarted.load() && !gIsImage.load() && !gPlayer.paused() && nowMs() - last > 1000) {
                 LOGI("no frames for 1s (app in the background?) - pausing the video");
                 gPlayer.pause();
             }
         }
         Player::detachThread();
     }).detach();
+}
+
+bool isImagePath(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".bmp" || ext == ".gif";
+}
+
+void releaseMedia() {
+    gPlayer.release();
+    gImage.release();
 }
 
 // ---------------------------------------------------------------------------
@@ -205,13 +221,15 @@ void startPrepare(const std::filesystem::path& path) {
     gPrepPath = path;
     gPrepTime = std::filesystem::last_write_time(path, ec);
     gDiscard = false;
+    gPrepImage = isImagePath(path);
+    const bool image = gPrepImage;
     const std::string file = path.string();
     const float volume = gConfig.volume;
-    LOGI("preparing %s in the background", file.c_str());
-    std::thread([file, volume] {
-        const bool ok = gPlayer.prepare(file, volume, true);
+    LOGI("preparing %s %s in the background", image ? "image" : "video", file.c_str());
+    std::thread([file, volume, image] {
+        const bool ok = image ? gImage.load(file, 2048) : gPlayer.prepare(file, volume, true);
         const bool discard = gDiscard.exchange(false);
-        if (discard && ok) gPlayer.release();
+        if (discard && ok) releaseMedia();
         Player::detachThread();
         gPrep = discard ? PrepNone : (ok ? PrepReady : PrepFailed);
     }).detach();
@@ -222,10 +240,11 @@ void releaseResources() {
     if (gPrep.load() == PrepBusy) {
         gDiscard = true;
     } else {
-        gPlayer.release();
+        releaseMedia();
         gPrep = PrepNone;
     }
     if (gRenderer.ready()) gRenderer.destroy();
+    gIsImage = false;
     gStarted = gFirstFrame = false;
     gFrameHandled = gFrameShown = false;
     gContext = EGL_NO_CONTEXT;
@@ -236,10 +255,11 @@ void abandonResources() {
     if (gPrep.load() == PrepBusy) {
         gDiscard = true;
     } else {
-        gPlayer.release();
+        releaseMedia();
         gPrep = PrepNone;
     }
     gRenderer.forget();
+    gIsImage = false;
     gStarted = gFirstFrame = false;
     gFrameHandled = gFrameShown = false;
     gContext = EGL_NO_CONTEXT;
@@ -262,29 +282,41 @@ bool isPanoramaTexture(GLint texture) {
     return std::find(gPanoTextures.begin(), gPanoTextures.end(), texture) != gPanoTextures.end();
 }
 
-// Six quads with the same program and six different textures at the start of a menu frame are the panorama faces.
-void learnPanorama(GLint program, GLsizei count, int index) {
-    if (!gLearnOpen) return;
-    const bool conforming = count == 6 && index < 6 && (index == 0 || program == gLearnProgram);
-    if (!conforming) {
-        gLearnOpen = false;
-        return;
-    }
-    if (index == 0) {
-        gLearning.clear();
-        gLearnProgram = program;
-    }
-    gLearning.push_back(texture0());
-    if (index < 5) return;
-    gLearnOpen = false;
+// Six quads in a row with the same program and six different textures are the panorama faces. The run may start
+// anywhere in the first draws of a menu frame (the game can draw something before it, e.g. a fade quad), but it
+// must be exactly six long, so a row of UI icons is not mistaken for it.
+bool commitRun() {
+    if (gLearning.size() != 6) return false;
     std::vector<GLint> unique = gLearning;
     std::sort(unique.begin(), unique.end());
     unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
-    if (unique.size() != 6 || unique.front() <= 0) return;
+    if (unique.size() != 6 || unique.front() <= 0) return false;
     if (unique != gPanoTextures) {
         gPanoTextures = unique;
-        LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", program,
+        LOGI("learned panorama faces: program %d, textures %d %d %d %d %d %d", gLearnProgram,
             unique[0], unique[1], unique[2], unique[3], unique[4], unique[5]);
+    }
+    return true;
+}
+
+void learnPanorama(GLint program, GLsizei count, int index) {
+    if (!gLearnOpen) return;
+    const bool quad = count == 6;
+    if (quad && (gLearning.empty() || program == gLearnProgram)) {
+        if (gLearning.empty()) gLearnProgram = program;
+        gLearning.push_back(texture0());
+    } else {
+        if (commitRun()) gLearnOpen = false; // a finished run of exactly six different textures
+        gLearning.clear();
+        if (quad && gLearnOpen) { // this quad starts a new run
+            gLearnProgram = program;
+            gLearning.push_back(texture0());
+        }
+    }
+    if (gLearnOpen && index + 1 >= kLeadingDraws) { // end of the window
+        commitRun();
+        gLearnOpen = false;
+        gLearning.clear();
     }
 }
 
@@ -355,7 +387,7 @@ bool startupStep() {
             if (path.empty()) {
                 gNextRetry = Clock::now() + std::chrono::seconds(2);
                 if (gRetries++ % 15 == 0) {
-                    LOGW("cannot read a video at %s - set \"video_path\" in %s (the normal panorama stays)",
+                    LOGW("cannot read a video or image at %s - set \"video_path\" in %s (the normal panorama stays)",
                         candidates().front().c_str(), configFile().c_str());
                 }
                 return false;
@@ -366,27 +398,36 @@ bool startupStep() {
     }
 }
 
-// GL part of starting, on the render thread: needs the player to be ready.
+// Uploads the decoded image into the renderer's 2D texture (a GL context must be current, texture bound).
+bool uploadImage() {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gRenderer.texture);
+    return gImage.upload();
+}
+
+// GL part of starting, on the render thread: needs the media to be ready.
 bool attachPlayback() {
-    if (!gRenderer.create()) {
+    if (!gRenderer.create(gPrepImage)) {
         gRenderer.destroy();
         gFailed = true;
         return false;
     }
-    if (!gPlayer.attachAndStart(gRenderer.texture)) {
+    const bool ok = gPrepImage ? uploadImage() : gPlayer.attachAndStart(gRenderer.texture);
+    if (!ok) {
         gRenderer.destroy();
-        gPlayer.release();
+        releaseMedia();
         gPrep = PrepNone;
         gNextRetry = Clock::now() + std::chrono::seconds(2);
         return false;
     }
+    gIsImage = gPrepImage;
     gLoadedPath = gPrepPath;
     gLoadedTime = gPrepTime;
     gContext = eglGetCurrentContext();
     gStarted = true;
-    gFirstFrame = false;
+    gFirstFrame = gPrepImage; // an image has its "frame" right away
     gRetries = 0;
-    LOGI("playing %s", gLoadedPath.c_str());
+    LOGI("showing %s %s", gPrepImage ? "image" : "video", gLoadedPath.c_str());
     return true;
 }
 
@@ -400,12 +441,16 @@ bool renderVideo() {
     do {
         if (!gStarted) {
             if (!attachPlayback()) break;
-        } else if (gPlayer.paused()) {
+        } else if (!gIsImage && gPlayer.paused()) {
             gPlayer.resume();
         }
 
         float matrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        if (!gPlayer.update(matrix)) {
+        if (gIsImage) {
+            // bitmaps are stored top row first, so flip v
+            const float flip[16] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1};
+            std::copy(flip, flip + 16, matrix);
+        } else if (!gPlayer.update(matrix)) {
             if (++gUpdateFailures > 60) {
                 LOGW("video frames cannot be read, restarting");
                 gUpdateFailures = 0;
@@ -422,7 +467,8 @@ bool renderVideo() {
         const int width = saved.viewport[2], height = saved.viewport[3];
         if (width <= 0 || height <= 0) break;
         const float screenAspect = static_cast<float>(width) / static_cast<float>(height);
-        const int vw = gPlayer.width(), vh = gPlayer.height();
+        const int vw = gIsImage ? gImage.width() : gPlayer.width();
+        const int vh = gIsImage ? gImage.height() : gPlayer.height();
         const float videoAspect = (vw > 0 && vh > 0) ? static_cast<float>(vw) / static_cast<float>(vh) : screenAspect;
         const bool cover = gConfig.fit == "cover";
         const bool wider = videoAspect > screenAspect;
@@ -443,7 +489,7 @@ bool renderVideo() {
         glDisable(GL_BLEND);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, gRenderer.texture);
+        glBindTexture(gRenderer.target, gRenderer.texture);
         glBindSampler(0, 0);
         glUseProgram(gRenderer.program);
         glUniform1i(gRenderer.uSampler, 0);
@@ -551,6 +597,7 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     gFrameShown = false;
     gFrameDraws = 0;
     gLearnOpen = true;
+    gLearning.clear();
 
     const EGLContext context = eglGetCurrentContext();
     const bool ownContext = gContext == EGL_NO_CONTEXT || context == gContext;
@@ -564,7 +611,8 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
             gl::SavedState saved;
             gl::save(saved);
             gRenderer.forget(); // the old objects died with the old context
-            const bool ok = gRenderer.create() && gPlayer.rebind(gRenderer.texture);
+            const bool ok = gIsImage ? (gRenderer.create(true) && uploadImage())
+                                     : (gRenderer.create() && gPlayer.rebind(gRenderer.texture));
             gl::restore(saved);
             if (ok) {
                 gContext = context;
@@ -600,6 +648,17 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     }
     gLastFramePano = gPanoThisFrame;
     gPanoThisFrame = false;
+    // The game can reload its textures (e.g. around loading a world), which gives the panorama new texture ids.
+    // If menu frames keep passing without the known ids showing up, forget them so they are learned again.
+    if (menu && !gPanoTextures.empty()) {
+        if (gLastFramePano) gNoPanoFrames = 0;
+        else if (++gNoPanoFrames == 120) {
+            LOGI("panorama textures not seen for 120 menu frames - relearning them");
+            gPanoTextures.clear();
+        }
+    } else {
+        gNoPanoFrames = 0;
+    }
     gTraceFrame = gConfig.debugTrace && ((menu && (gMenuFrames == 300 || gMenuFrames == 301 || gMenuFrames == 302)) || gTraceFramesLeft > 0);
     if (gTraceFramesLeft > 0) --gTraceFramesLeft;
     if (gTraceFrame && gMenuFrames == 300) LOGI("--- tracing 3 menu frames ---");
@@ -617,7 +676,7 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
     }
 
     // Leaving the menu (or the panorama is gone): pause so it costs nothing in the world.
-    if (gStarted && !gPlayer.paused() && gLastSeen != Clock::time_point{}
+    if (gStarted && !gIsImage && !gPlayer.paused() && gLastSeen != Clock::time_point{}
         && Clock::now() - gLastSeen > std::chrono::milliseconds(600)) {
         gPlayer.pause();
     }
@@ -672,6 +731,7 @@ void setup(JavaVM* vm, const std::filesystem::path& resourceDir, const std::file
     Player::setJavaVm(vm);
     gResourceDir = resourceDir;
     gConfigDir = configDir;
+    gConfig.videoPath = (configDir / "menu.mp4").string(); // default; overridden by config.json
     log::setFile(configDir / "log.txt");
     LOGI("BackgroundVideo 1.0.0 starting");
     readConfig();
@@ -711,7 +771,7 @@ void preload() {
     if (!gEnabled.load() || gPrep.load() != PrepNone) return;
     const auto path = findVideo();
     if (!path.empty()) startPrepare(path);
-    else LOGI("preload: no video found yet, will look again when the menu shows");
+    else LOGI("preload: no video or image found yet, will look again when the menu shows");
 }
 
 void setEnabled(bool enabled) {

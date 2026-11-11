@@ -269,4 +269,81 @@ void Player::releaseAll(JNIEnv* env) {
     mDuration = mWidth = mHeight = 0;
 }
 
+
+bool Image::load(const std::string& path, int maxSize) {
+    JNIEnv* env = currentEnv();
+    if (!env) return false;
+    release();
+
+    jclass factory = env->FindClass("android/graphics/BitmapFactory");
+    jclass bitmapClass = env->FindClass("android/graphics/Bitmap");
+    if (!factory || !bitmapClass || !javaOk(env, "image classes")) return false;
+    jmethodID decodeFile = env->GetStaticMethodID(factory, "decodeFile", "(Ljava/lang/String;)Landroid/graphics/Bitmap;");
+    jmethodID getWidth = env->GetMethodID(bitmapClass, "getWidth", "()I");
+    jmethodID getHeight = env->GetMethodID(bitmapClass, "getHeight", "()I");
+    jmethodID recycle = env->GetMethodID(bitmapClass, "recycle", "()V");
+    jmethodID scale = env->GetStaticMethodID(bitmapClass, "createScaledBitmap", "(Landroid/graphics/Bitmap;IIZ)Landroid/graphics/Bitmap;");
+    if (!decodeFile || !getWidth || !getHeight || !recycle || !scale || !javaOk(env, "image methods")) return false;
+
+    jstring jpath = env->NewStringUTF(path.c_str());
+    jobject bitmap = env->CallStaticObjectMethod(factory, decodeFile, jpath);
+    env->DeleteLocalRef(jpath);
+    if (!javaOk(env, "decodeFile") || !bitmap) {
+        LOGE("cannot decode the image (unsupported or corrupt file?)");
+        return false;
+    }
+    int width = env->CallIntMethod(bitmap, getWidth);
+    int height = env->CallIntMethod(bitmap, getHeight);
+
+    // Keep very large images within what the GPU handles comfortably.
+    const int largest = width > height ? width : height;
+    if (maxSize > 0 && largest > maxSize) {
+        const float factor = static_cast<float>(maxSize) / static_cast<float>(largest);
+        const int newWidth = static_cast<int>(static_cast<float>(width) * factor + 0.5f);
+        const int newHeight = static_cast<int>(static_cast<float>(height) * factor + 0.5f);
+        jobject scaled = env->CallStaticObjectMethod(bitmapClass, scale, bitmap, newWidth > 0 ? newWidth : 1, newHeight > 0 ? newHeight : 1, JNI_TRUE);
+        if (javaOk(env, "createScaledBitmap") && scaled) {
+            env->CallVoidMethod(bitmap, recycle);
+            javaOk(env, "recycle");
+            env->DeleteLocalRef(bitmap);
+            bitmap = scaled;
+            width = newWidth;
+            height = newHeight;
+        }
+    }
+    mBitmap = env->NewGlobalRef(bitmap);
+    env->DeleteLocalRef(bitmap);
+    mWidth = width;
+    mHeight = height;
+    LOGI("image decoded (%dx%d)", mWidth, mHeight);
+    return mBitmap != nullptr;
+}
+
+bool Image::upload() {
+    JNIEnv* env = currentEnv();
+    if (!env || !mBitmap) return false;
+    jclass glUtils = env->FindClass("android/opengl/GLUtils");
+    if (!glUtils || !javaOk(env, "GLUtils")) return false;
+    jmethodID texImage2D = env->GetStaticMethodID(glUtils, "texImage2D", "(IILandroid/graphics/Bitmap;I)V");
+    if (!texImage2D || !javaOk(env, "texImage2D")) return false;
+    env->CallStaticVoidMethod(glUtils, texImage2D, 0x0DE1 /* GL_TEXTURE_2D */, 0, mBitmap, 0);
+    return javaOk(env, "texImage2D call");
+}
+
+void Image::release() {
+    if (!mBitmap) return;
+    JNIEnv* env = currentEnv();
+    if (env) {
+        jclass bitmapClass = env->FindClass("android/graphics/Bitmap");
+        if (bitmapClass && javaOk(env, "Bitmap class")) {
+            jmethodID recycle = env->GetMethodID(bitmapClass, "recycle", "()V");
+            if (recycle) env->CallVoidMethod(mBitmap, recycle);
+            javaOk(env, "recycle");
+        }
+        env->DeleteGlobalRef(mBitmap);
+    }
+    mBitmap = nullptr;
+    mWidth = mHeight = 0;
+}
+
 }

@@ -16,11 +16,21 @@ void main() {
 }
 )";
 
-constexpr const char* kFragmentShader = R"(
+constexpr const char* kFragmentExternal = R"(
 #extension GL_OES_EGL_image_external : require
 precision mediump float;
 varying vec2 vUv;
 uniform samplerExternalOES uSampler;
+uniform float uBrightness;
+void main() {
+    gl_FragColor = vec4(texture2D(uSampler, vUv).rgb * uBrightness, 1.0);
+}
+)";
+
+constexpr const char* kFragmentImage = R"(
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D uSampler;
 uniform float uBrightness;
 void main() {
     gl_FragColor = vec4(texture2D(uSampler, vUv).rgb * uBrightness, 1.0);
@@ -53,6 +63,7 @@ void save(SavedState& s) {
     glGetIntegerv(GL_ACTIVE_TEXTURE, &s.activeTexture);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &s.externalTexture);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.texture2d);
     glGetIntegerv(GL_SAMPLER_BINDING, &s.sampler);
     glGetIntegerv(GL_VIEWPORT, s.viewport);
     glGetIntegerv(GL_BLEND_SRC_RGB, &s.blendSrcRgb);
@@ -83,6 +94,7 @@ void restore(const SavedState& s) {
     glBindSampler(0, s.sampler);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, s.externalTexture);
+    glBindTexture(GL_TEXTURE_2D, s.texture2d);
     glActiveTexture(s.activeTexture);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s.drawFbo);
     glBindVertexArray(s.vao);
@@ -90,9 +102,10 @@ void restore(const SavedState& s) {
     glUseProgram(s.program);
 }
 
-bool Renderer::create() {
+bool Renderer::create(bool image) {
+    target = image ? GL_TEXTURE_2D : GL_TEXTURE_EXTERNAL_OES;
     GLuint vs = compile(GL_VERTEX_SHADER, kVertexShader);
-    GLuint fs = compile(GL_FRAGMENT_SHADER, kFragmentShader);
+    GLuint fs = compile(GL_FRAGMENT_SHADER, image ? kFragmentImage : kFragmentExternal);
     if (!vs || !fs) {
         if (vs) glDeleteShader(vs);
         if (fs) glDeleteShader(fs);
@@ -121,11 +134,11 @@ bool Renderer::create() {
 
     glGenTextures(1, &texture);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(target, texture);
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);

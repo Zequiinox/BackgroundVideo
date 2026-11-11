@@ -7,7 +7,7 @@ namespace bgv::gl {
 
 // Everything we change while drawing, so the game never notices.
 struct SavedState {
-    GLint program = 0, arrayBuffer = 0, vao = 0, drawFbo = 0, activeTexture = 0, externalTexture = 0, sampler = 0;
+    GLint program = 0, arrayBuffer = 0, vao = 0, drawFbo = 0, activeTexture = 0, externalTexture = 0, texture2d = 0, sampler = 0;
     GLint viewport[4]{};
     GLint blendSrcRgb = 0, blendDstRgb = 0, blendSrcAlpha = 0, blendDstAlpha = 0;
     GLint blendEqRgb = 0, blendEqAlpha = 0;
@@ -18,12 +18,13 @@ struct SavedState {
 void save(SavedState& state);
 void restore(const SavedState& state);
 
-// External-texture quad renderer (fed by a SurfaceTexture).
+// Textured quad renderer: an external texture fed by a SurfaceTexture (video) or a plain 2D texture (image).
 struct Renderer {
     GLuint program = 0, texture = 0, vbo = 0, vao = 0;
+    GLenum target = GL_TEXTURE_EXTERNAL_OES;
     GLint uTexMatrix = -1, uBrightness = -1, uSampler = -1;
 
-    bool create();
+    bool create(bool image = false);
     void destroy();
     // The GL context is gone: forget the ids without calling GL (they could name unrelated objects now).
     void forget() { vbo = vao = texture = program = 0; }
