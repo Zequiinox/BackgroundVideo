@@ -66,7 +66,7 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 | --- | --- | --- |
 | `video_path` | `<config folder>/menu.mp4` | Full path to your video or image |
 | `video` | `menu.mp4` | Used only when `video_path` is empty: file name in the config folder |
-| `hide_ui_background` | `true` | Also hide a full-screen background image that a UI pack draws over the panorama |
+| `hide_ui_background` | `true` | Also hide a wallpaper image (larger than the screen) that a UI pack draws over the panorama |
 | `audio_enabled` | `true` | Play the video's sound (also a toggle in the in-game mod menu) |
 | `audio_volume` | `1.0` | 0.0 to 1.0 (also a slider in the in-game mod menu) |
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
@@ -86,9 +86,11 @@ overlays they draw come after the panorama. Some big UI themes also draw their *
 the start screen (for example CubeVisage UI ships a 2800x1272 `bg.jpg`), which would sit on top of the video and hide it.
 
 With `hide_ui_background` on (the default) the mod also skips such a background: once the video has been drawn in a
-frame, a wide image quad among the first draws of the menu frame whose texture is at least 75% of the screen width and
-clearly wider than tall is treated as a pack background and not drawn. The pack's tint layers and panels are kept, so
-the video shows through them. Set `"hide_ui_background": false` to keep the pack's background instead.
+frame, an image quad among the first draws of the menu frame whose texture is **larger than the screen in both
+directions** is treated as a pack wallpaper and not drawn. The pack's tint layers and panels are kept, so the video
+shows through them. Backdrops that are screen-sized or smaller (for example the dimmed or blurred copy that screens like
+Play and Settings draw behind themselves) are never touched. Set `"hide_ui_background": false` to keep the pack's
+background instead. Limitation: a pack wallpaper that is not larger than your screen is not detected.
 
 The panorama itself is only recognised as the very first six quads of a menu frame (confirmed over two frames in a row),
 so extra things a pack draws on the menu are never mistaken for it.

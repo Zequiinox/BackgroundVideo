@@ -633,15 +633,17 @@ bool replacePanorama(int fn, GLsizei count) {
     if (!panorama && leading) panorama = isCubemapProgram(static_cast<GLuint>(program));
     if (!panorama) {
         // A UI pack can draw its own full-screen background image right after the panorama, which would cover the
-        // video. Once the video was drawn this frame, a wide, screen-sized-or-larger image quad among the leading
-        // draws is such a background: skip it too so the video shows through the pack's tint layers and panels.
+        // video. Once the video was drawn this frame, an image quad among the leading draws whose texture is LARGER
+        // than the screen in both directions is such a wallpaper: skip it too so the video shows through the pack's
+        // tint layers and panels. Screens that are not restyled draw screen-sized (or smaller) backdrops, e.g. a
+        // dimmed or blurred copy of what is behind them; those are never larger than the screen and must be kept.
         if (gConfig.hideBackground && leading && count == 6 && gFrameShown) {
             const GLint tex = texture0();
             GLint viewport[4]{};
             glGetIntegerv(GL_VIEWPORT, viewport);
             int w = 0, h = 0;
-            if (tex > 0 && textureSize(tex, w, h) && h > 0 && w >= static_cast<int>(viewport[2] * 0.75f)
-                && static_cast<float>(w) >= static_cast<float>(h) * 1.3f) {
+            if (tex > 0 && textureSize(tex, w, h) && viewport[2] > 0 && viewport[3] > 0
+                && w > viewport[2] && h > viewport[3]) {
                 if (!gLoggedBackground) {
                     gLoggedBackground = true;
                     LOGI("hiding a full-screen UI background behind the video: texture %d (%dx%d)", tex, w, h);
