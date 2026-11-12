@@ -66,6 +66,7 @@ Edit `Author` in `src/Version.hpp` and `levimod.json` before you publish.
 | --- | --- | --- |
 | `video_path` | `<config folder>/menu.mp4` | Full path to your video or image |
 | `video` | `menu.mp4` | Used only when `video_path` is empty: file name in the config folder |
+| `hide_ui_background` | `true` | Also hide a full-screen background image that a UI pack draws over the panorama |
 | `audio_enabled` | `true` | Play the video's sound (also a toggle in the in-game mod menu) |
 | `audio_volume` | `1.0` | 0.0 to 1.0 (also a slider in the in-game mod menu) |
 | `fit` | `cover` | `cover` fills the screen (crops edges), `contain` shows black bars |
@@ -81,15 +82,19 @@ The mod registers a **Menu Video Background** module in the LeviLauncher mod men
 ## UI / theme packs
 
 The mod replaces the *native panorama*. Resource packs that restyle the menu normally still work, because the buttons and
-overlays they draw come after the panorama. A pack that draws its **own full-screen background image** on the start
-screen (some big UI themes do) puts that image on top of the panorama spot, so you will see the pack's image instead of
-the video. Turn that background off in the pack, or use one or the other.
+overlays they draw come after the panorama. Some big UI themes also draw their **own full-screen background image** on
+the start screen (for example CubeVisage UI ships a 2800x1272 `bg.jpg`), which would sit on top of the video and hide it.
 
-The panorama is only recognised as the very first six quads of a menu frame (confirmed over two frames in a row), so
-extra things a pack draws on the menu are never mistaken for it.
+With `hide_ui_background` on (the default) the mod also skips such a background: once the video has been drawn in a
+frame, a wide image quad among the first draws of the menu frame whose texture is at least 75% of the screen width and
+clearly wider than tall is treated as a pack background and not drawn. The pack's tint layers and panels are kept, so
+the video shows through them. Set `"hide_ui_background": false` to keep the pack's background instead.
+
+The panorama itself is only recognised as the very first six quads of a menu frame (confirmed over two frames in a row),
+so extra things a pack draws on the menu are never mistaken for it.
 
 If a pack still misbehaves, set `"debug_trace": true` in `config.json`, open the menu with the pack enabled, and send
-`log.txt`: it records what the menu draws, frame by frame.
+`log.txt`: it records what the menu draws frame by frame, including the size of the texture of each draw (`size0=WxH`).
 
 ## Troubleshooting
 

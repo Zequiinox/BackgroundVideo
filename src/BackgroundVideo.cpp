@@ -6,6 +6,7 @@
 #include "Player.hpp"
 
 #include <EGL/egl.h>
+#include <GLES3/gl31.h> // glGetTexLevelParameteriv (GLES 3.1)
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -32,6 +33,7 @@ struct Config {
     std::string videoPath;                // full path to a video or an image (png/jpg/webp/bmp/gif); defaults to <config folder>/menu.mp4
     std::string video = "menu.mp4";       // used only when video_path is empty: looked up in the config/resources folder
     std::string fit = "cover";            // "cover" fills the screen (crops), "contain" shows black bars
+    bool hideBackground = true;           // hide a full-screen background image that a UI pack draws right after the panorama
     float brightness = 1.0f;              // 0.0 - 1.0, lower it if the menu text is hard to read
     bool debugTrace = false;              // log every draw call of three menu frames (for bug reports)
 };
@@ -104,6 +106,7 @@ void readConfig() {
     read("video_path", gConfig.videoPath);
     read("video", gConfig.video);
     read("fit", gConfig.fit);
+    read("hide_ui_background", gConfig.hideBackground);
     read("brightness", gConfig.brightness);
     read("debug_trace", gConfig.debugTrace);
     gConfig.brightness = std::clamp(gConfig.brightness, 0.0f, 1.0f);
@@ -153,6 +156,7 @@ void writeDefaultConfigIfMissing() {
         {"video_path", gConfig.videoPath},
         {"video", gConfig.video},
         {"fit", gConfig.fit},
+        {"hide_ui_background", gConfig.hideBackground},
         {"brightness", gConfig.brightness},
         {"debug_trace", gConfig.debugTrace},
         {"audio_enabled", gAudioOn.load()},
@@ -208,6 +212,7 @@ long gDrawsInMenu[5]{};      // elements, arrays, elementsInstanced, arraysInsta
 bool gLoggedReplace = false;
 bool gLoggedNoPanorama = false;
 bool gLoggedGl = false;
+bool gLoggedBackground = false;
 bool gTraceFrame = false;
 int gProgramsLogged = 0;
 std::atomic<long long> gLastSwapMs{0}; // when the render thread last finished a frame
@@ -408,6 +413,29 @@ bool isCubemapProgram(GLuint program) {
     return cube;
 }
 
+// Size of the texture bound as 2D on unit 0, cached by texture id (needs GLES 3.1, the device here has 3.2).
+std::unordered_map<GLint, std::pair<int, int>> gTexSize;
+
+bool textureSize(GLint texture, int& width, int& height) {
+    const auto cached = gTexSize.find(texture);
+    if (cached != gTexSize.end()) {
+        width = cached->second.first;
+        height = cached->second.second;
+        return true;
+    }
+    GLint active = 0, w = 0, h = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    glActiveTexture(static_cast<GLenum>(active));
+    if (gTexSize.size() > 2048) gTexSize.clear();
+    gTexSize[texture] = {w, h};
+    width = w;
+    height = h;
+    return true;
+}
+
 void traceDraw(const char* fn, GLsizei count, GLint program) {
     GLint fbo = 0, active = 0, viewport[4]{};
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
@@ -422,6 +450,11 @@ void traceDraw(const char* fn, GLsizei count, GLint program) {
         glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &cube);
         used += std::snprintf(units + used, sizeof(units) - used, "u%d(2d=%d cube=%d) ", unit, tex2d, cube);
     }
+    glActiveTexture(GL_TEXTURE0);
+    GLint tw = 0, th = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    used += std::snprintf(units + used, sizeof(units) - used, "size0=%dx%d ", tw, th);
     glActiveTexture(static_cast<GLenum>(active));
     LOGI("trace %s prog=%d fbo=%d vp=%dx%d count=%d %s", fn, program, fbo, viewport[2], viewport[3], count, units);
 }
@@ -598,7 +631,26 @@ bool replacePanorama(int fn, GLsizei count) {
     // Detection by the learned face textures works at any position in the frame; only quads (count 6) are checked.
     bool panorama = count == 6 && !gPanoTextures.empty() && isPanoramaTexture(texture0());
     if (!panorama && leading) panorama = isCubemapProgram(static_cast<GLuint>(program));
-    if (!panorama) return false;
+    if (!panorama) {
+        // A UI pack can draw its own full-screen background image right after the panorama, which would cover the
+        // video. Once the video was drawn this frame, a wide, screen-sized-or-larger image quad among the leading
+        // draws is such a background: skip it too so the video shows through the pack's tint layers and panels.
+        if (gConfig.hideBackground && leading && count == 6 && gFrameShown) {
+            const GLint tex = texture0();
+            GLint viewport[4]{};
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            int w = 0, h = 0;
+            if (tex > 0 && textureSize(tex, w, h) && h > 0 && w >= static_cast<int>(viewport[2] * 0.75f)
+                && static_cast<float>(w) >= static_cast<float>(h) * 1.3f) {
+                if (!gLoggedBackground) {
+                    gLoggedBackground = true;
+                    LOGI("hiding a full-screen UI background behind the video: texture %d (%dx%d)", tex, w, h);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
 
     ++gPanoramaDraws;
     gPanoThisFrame = true;
@@ -777,7 +829,10 @@ EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
             }
         }
     }
-    if ((gFrameCount % 600) == 0) gProgramCache.clear(); // program ids can be reused by the game
+    if ((gFrameCount % 600) == 0) {
+        gProgramCache.clear(); // program and texture ids can be reused by the game
+        gTexSize.clear();
+    }
 
     return gSwapOriginal ? gSwapOriginal(display, surface) : EGL_FALSE;
 }
